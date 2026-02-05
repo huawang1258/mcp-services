@@ -1,14 +1,22 @@
 {
-  "name": "mcp-log-query",
+  "name": "mcp-log-query-server",
   "version": "1.0.0",
   "description": "MCP Server for querying server logs via SSH jump host",
   "main": "index.js",
   "type": "module",
+  "bin": {
+    "mcp-log-query": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "config.js",
+    "ssh-client.js",
+    "server-sse.js",
+    "README.md"
+  ],
   "scripts": {
     "start": "node index.js",
-    "start:sse": "node server-sse.js",
-    "test": "node test.js",
-    "test:ssh": "node test.js --ssh"
+    "start:sse": "node server-sse.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
@@ -20,9 +28,15 @@
     "mcp",
     "ssh",
     "log",
-    "kubernetes"
+    "kubernetes",
+    "model-context-protocol"
   ],
-  "author": "",
-  "license": "MIT"
+  "author": "huawang1258",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/huawang1258/mcp-services.git"
+  },
+  "homepage": "https://github.com/huawang1258/mcp-services#readme"
 }
 
