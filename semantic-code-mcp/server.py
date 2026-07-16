@@ -71,6 +71,9 @@ _MAX_ENTITY_LINES = 30
 _MAX_CHUNK_LINES = 80
 # 单行最大字符数：builder 链/SQL 拼接行能到几百字符，截尾不影响理解
 _MAX_LINE_CHARS = 200
+# 单文件字符总预算：行数预算管不住长行密集文件（120 行×200 字符最坏 24KB），
+# 字符级预算顶住 token 上限
+_MAX_FILE_CHARS = 8000
 # 关联（call graph）块最多展示行数
 _MAX_RELATED_LINES = 20
 
@@ -143,6 +146,18 @@ def _format_file_group(idx: int, file_path: str, chunks: list[dict]) -> str:
         body.extend(lines)
         budget -= used
         prev_end = max(prev_end or 0, c.get("end_line", start + used - 1))
+        if sum(len(l) + 1 for l in body) >= _MAX_FILE_CHARS:
+            # 超出字符预算：从尾部丢行直到预算内，再标记截断
+            total = 0
+            keep = 0
+            for l in body:
+                total += len(l) + 1
+                if total > _MAX_FILE_CHARS:
+                    break
+                keep += 1
+            body = body[:keep]
+            body.append("... (file output budget reached)")
+            break
     return f"{header}\n```{lang}\n" + "\n".join(body) + "\n```"
 
 

@@ -53,8 +53,9 @@ _NAME_TOKEN_BOOST = 0.1
 _MAX_PER_FILE = 2
 # barrel / 纯导出入口文件降权（实现文件优先于 re-export 入口）
 _BARREL_PENALTY = 0.85
-# 非代码文件（文档/配置）温和降权：分数接近时实现代码优先，不影响文档类查询的大分差命中
-_NON_CODE_PENALTY = 0.8
+# 非代码文件（文档/配置）降权：分数接近时实现代码优先，不影响文档类查询的大分差命中
+# （doc/config 意图查询走反转 boost 不受此值影响；0.7 治动作型查询里 properties 混尾部）
+_NON_CODE_PENALTY = 0.7
 _NON_CODE_LANGS = {"markdown", "yaml", "json", "toml", "properties", "text"}
 _BARREL_NAMES = {"index.ts", "index.js", "index.tsx", "index.jsx", "index.mjs", "__init__.py", "mod.rs"}
 # 调用链意图："谁调用/被哪些...调用/谁写入/在哪被使用/who calls/callers of/writes to"
@@ -116,6 +117,11 @@ _COMPOUND_SPLIT_RE = re.compile(
 _COMPOUND_MIN_LEN = 2
 # 子查询召回路权重（低于主查询，防拆分噪声反客为主）
 _COMPOUND_SUB_WEIGHT = 0.7
+# 子查询保底：rerank 用原始完整 query 重打分会把子意图召回的文档抹平
+# （"生成...并清理"的语义重心压向主意图）。保底触发条件：某子意图召回的
+# 前 N 名文件与最终结果零交集（完全无代表）；保底块必须来自已过
+# RRF 候选门槛的 candidates（全库 top-1 直插会把"清理"这种宽泛词的噪声带进来）
+_COMPOUND_PROBE_TOP = 10
 
 
 class Retriever:
@@ -331,17 +337,22 @@ class Retriever:
                 weights.append(weights[0])
         # 2.9 复合意图拆分（"生成+清理"）：单次向量召回对双动作查询天然偏科，
         #     各子查询独立召回后低权重并入 RRF，两个意图都能拿到席位
+        sub_probes: list[list[int]] = []  # 每个子查询自己的前 N 名（保底探针用）
         for sub in self._compound_subqueries(query):
             s_emb = self.embedder.embed_query(sub)
-            rank_lists.append([cid for cid, _ in self.store.search_vector(s_emb, top_k)])
-            weights.append(_COMPOUND_SUB_WEIGHT)
+            sub_lists = [[cid for cid, _ in self.store.search_vector(s_emb, top_k)]]
             sub_fts = (
                 self.store.search_fts_trigram(sub, top_k)
                 if _CJK_RE.search(sub) else self.store.search_fts(sub, top_k)
             )
             if sub_fts:
-                rank_lists.append([cid for cid, _ in sub_fts])
+                sub_lists.append([cid for cid, _ in sub_fts])
+            for sl in sub_lists:
+                rank_lists.append(sl)
                 weights.append(_COMPOUND_SUB_WEIGHT)
+            mini = self._rrf(sub_lists)
+            if mini:
+                sub_probes.append([cid for cid, _ in mini[:_COMPOUND_PROBE_TOP]])
         # 3. RRF 融合（仅用排名）
         fused = self._rrf(rank_lists, weights=weights)
         if not fused:
@@ -433,6 +444,41 @@ class Retriever:
             results.append(c)
             if len(results) >= top_n:
                 break
+        # 6.5 子查询保底：某子意图召回的前 N 名文件与结果零交集（完全无代表）时，
+        #     从 candidates 里按探针名次挑一块替换当前最低分名额，防 rerank 用
+        #     完整 query 重打分把子意图抹平；已有代表则不动（避免顶掉更相关结果）
+        if sub_probes and results:
+            by_id = {c.get("id"): c for c in candidates}
+            probe_ids = [cid for p in sub_probes for cid in p]
+            probe_chunks = self.store.get_chunks(probe_ids)
+            rescued_ids: set[int] = set()
+            for probe in sub_probes:
+                result_files = {r.get("file_path", "") for r in results}
+                probe_files = {
+                    probe_chunks[cid]["file_path"] for cid in probe if cid in probe_chunks
+                }
+                if result_files & probe_files:
+                    continue  # 该子意图已有代表
+                for cid in probe:
+                    ch = by_id.get(cid)
+                    if not ch or cid in rescued_ids:
+                        continue  # 只保底过了候选门槛的块，全库 top-1 噪声不直插
+                    fp = ch.get("file_path", "")
+                    if path_filter and not self._path_match(fp, path_filter):
+                        continue
+                    if len(results) >= top_n:
+                        low = min(
+                            (i for i, r in enumerate(results) if r.get("id") not in rescued_ids),
+                            key=lambda i: results[i].get("score", 0.0),
+                            default=None,
+                        )
+                        if low is None:
+                            break
+                        results[low] = ch
+                    else:
+                        results.append(ch)
+                    rescued_ids.add(cid)
+                    break
         # 7. call graph 扩展（在主结果基础上连带召回调用关系）
         if expand_graph and results:
             fused_scores = dict(fused)

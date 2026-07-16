@@ -201,11 +201,13 @@ def test_caller_intent_and_barrel() -> None:
     assert Retriever._is_barrel_file("pkg\\__init__.py")
     assert not Retriever._is_barrel_file("src/tools/planner.ts")
     # 非代码乘数：文档意图 > 配置意图 > 默认降权；代码文件恒为 1
+    from retriever import _NON_CODE_PENALTY
+
     assert Retriever._noncode_mult("go", False, True) == 1.0
-    assert Retriever._noncode_mult("yaml", False, False) == 0.8
+    assert Retriever._noncode_mult("yaml", False, False) == _NON_CODE_PENALTY
     assert Retriever._noncode_mult("yaml", False, True) == 1.4
     assert Retriever._noncode_mult("yaml", True, True) == 1.5
-    assert Retriever._noncode_mult("markdown", False, True) == 0.8  # md 不吃配置意图
+    assert Retriever._noncode_mult("markdown", False, True) == _NON_CODE_PENALTY  # md 不吃配置意图
 
     # 端到端：用真实 store 验证 callers_of 路由（chunker.py 里的函数互相调用）
     tmpdir = tempfile.mkdtemp()
