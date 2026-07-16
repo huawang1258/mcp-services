@@ -81,6 +81,10 @@ _DECL_PENALTY = 0.75
 _ENTITY_PENALTY = 0.85
 # 查询显式找接口定义/契约时不惩罚声明块
 _DECL_INTENT_RE = re.compile(r"(接口定义|契约|declaration|signature|\binterface\b|feign)", re.I)
+# 实现/过程意图（"怎么生成"、"how is X done"）：答案在实现代码里，
+# DTO/接口即使语义相似也回答不了"怎么做"，加重降权
+_IMPL_INTENT_RE = re.compile(r"(怎么|如何|怎样|流程|逻辑|实现|\bhow\b|implement)", re.I)
+_IMPL_INTENT_EXTRA = 0.75
 # 同名接口/实现配对：结果集同时出现 X 与 XImpl 时，实现继承接口分数排到前面
 _IMPL_PAIR_FACTOR = 1.01
 _JAVA_INTERFACE_RE = re.compile(r"^\s*(?:public\s+)?(?:@\w+(?:\([^)]*\))?\s+)*interface\s+\w", re.M)
@@ -369,6 +373,7 @@ class Retriever:
         doc_intent = bool(_DOC_INTENT_RE.search(query))
         config_intent = bool(_CONFIG_INTENT_RE.search(query))
         decl_intent = bool(_DECL_INTENT_RE.search(query))
+        impl_intent = not decl_intent and bool(_IMPL_INTENT_RE.search(query))
         for c in candidates:
             mult = 1.0
             fp = c.get("file_path", "")
@@ -383,9 +388,9 @@ class Retriever:
                 c["entity"] = True  # 展示层据此收紧行预算（DTO 字段列表不值得全量吐）
             if not decl_intent:
                 if is_decl:
-                    mult *= _DECL_PENALTY
+                    mult *= _DECL_PENALTY * (_IMPL_INTENT_EXTRA if impl_intent else 1.0)
                 elif is_entity:
-                    mult *= _ENTITY_PENALTY
+                    mult *= _ENTITY_PENALTY * (_IMPL_INTENT_EXTRA if impl_intent else 1.0)
             mult *= self._name_boost(qtokens, c)
             c["score"] *= mult
         # 5.5 接口/实现配对：XImpl 继承同名 X（接口）的更高分，实现排到声明前面
