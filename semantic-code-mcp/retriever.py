@@ -88,6 +88,10 @@ _IMPL_INTENT_RE = re.compile(r"(怎么|如何|怎样|流程|逻辑|实现|\bhow\
 _IMPL_INTENT_EXTRA = 0.75
 # 同名接口/实现配对：结果集同时出现 X 与 XImpl 时，实现继承接口分数排到前面
 _IMPL_PAIR_FACTOR = 1.01
+# 超短块（≤此行数）降权：单行方法声明这类低信息命中信息密度撑不起
+# 独立席位（尾部占位问题）；温和系数，分数接近时才让位给实质内容
+_TINY_CHUNK_LINES = 2
+_TINY_CHUNK_PENALTY = 0.85
 _JAVA_INTERFACE_RE = re.compile(r"^\s*(?:public\s+)?(?:@\w+(?:\([^)]*\))?\s+)*interface\s+\w", re.M)
 _CONTROL_FLOW_RE = re.compile(r"\b(if|for|while|switch|return)\b")
 # 块内声明方法名提取（caller 方向图扩展用），每块最多取这么多个
@@ -453,6 +457,8 @@ class Retriever:
                     mult *= c["_decl_mult"]
                 elif is_entity:
                     mult *= _ENTITY_PENALTY * (_IMPL_INTENT_EXTRA if impl_intent else 1.0)
+            if c.get("end_line", 0) - c.get("start_line", 0) + 1 <= _TINY_CHUNK_LINES:
+                mult *= _TINY_CHUNK_PENALTY
             mult *= self._name_boost(qtokens, c)
             c["score"] *= mult
         # 5.5 接口/实现配对（文件级）：接口块 symbol 是类名、实现块 symbol 是方法名，
