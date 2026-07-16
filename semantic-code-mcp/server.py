@@ -104,8 +104,9 @@ def _numbered_lines(code: str, start_line: int, budget: int) -> tuple[list[str],
     code_lines = code.split("\n")
     take = code_lines[:budget]
     out = [
-        f"{start_line + i:>6}\t" + (l if len(l) <= _MAX_LINE_CHARS else l[:_MAX_LINE_CHARS] + " …")
-        for i, l in enumerate(take)
+        f"{start_line + i:>6}\t"
+        + (ln if len(ln) <= _MAX_LINE_CHARS else ln[:_MAX_LINE_CHARS] + " …")
+        for i, ln in enumerate(take)
     ]
     omitted = len(code_lines) - len(take)
     if omitted > 0:
@@ -146,12 +147,12 @@ def _format_file_group(idx: int, file_path: str, chunks: list[dict]) -> str:
         body.extend(lines)
         budget -= used
         prev_end = max(prev_end or 0, c.get("end_line", start + used - 1))
-        if sum(len(l) + 1 for l in body) >= _MAX_FILE_CHARS:
+        if sum(len(ln) + 1 for ln in body) >= _MAX_FILE_CHARS:
             # 超出字符预算：从尾部丢行直到预算内，再标记截断
             total = 0
             keep = 0
-            for l in body:
-                total += len(l) + 1
+            for ln in body:
+                total += len(ln) + 1
                 if total > _MAX_FILE_CHARS:
                     break
                 keep += 1

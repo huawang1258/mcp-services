@@ -148,6 +148,8 @@ class Retriever:
         self.rerank_model = rerank_model
         key = rerank_api_key or os.getenv("COHERE_API_KEY")
         self.cohere_client = cohere.Client(key) if (key and cohere) else None
+        # 节流时间戳无锁：SCM_RERANK_MIN_INTERVAL 仅评测等单线程密集场景启用，
+        # 生产默认 0（不节流），并发竞态最坏多发一次请求、由 429 重试兜底
         self._last_rerank_ts = 0.0
         # 查询扩展（HyDE + 多查询变体）：默认按 SCM_QUERY_EXPANSION 开关创建
         self.expander = expander if expander is not None else create_expander()
@@ -305,8 +307,9 @@ class Retriever:
     ) -> list[dict]:
         """检索并返回 top_n 个代码块（dict，含 score）。
 
-        排序管线：向量+BM25 召回 → RRF → rerank（可选）→ 调用链意图置顶 →
-        意图感知降权/boost + 名称 boost → 文件多样性截断（每文件最多 max_per_file 块）。
+        排序管线：向量+BM25(+trigram/子查询) 召回 → RRF → rerank + 子查询分数混合
+        （可选）→ 调用链意图置顶 → 意图感知降权/boost + 名称 boost → 接口-实现
+        配对 → 文件多样性截断（每文件最多 max_per_file 块）→ 子查询保底。
 
         path_filter：可选文件路径过滤，含通配符按 glob 匹配，否则按子串匹配。
 
@@ -360,8 +363,8 @@ class Retriever:
                 rank_lists.append(sl)
                 weights.append(_COMPOUND_SUB_WEIGHT)
             mini = self._rrf(sub_lists)
-            if mini:
-                sub_probes.append([cid for cid, _ in mini[:_COMPOUND_PROBE_TOP]])
+            # 召回为空也 append 空探针，保持与 subs 一一对应（4.2 按下标 zip 配对）
+            sub_probes.append([cid for cid, _ in mini[:_COMPOUND_PROBE_TOP]])
         # 3. RRF 融合（仅用排名）
         fused = self._rrf(rank_lists, weights=weights)
         if not fused:
@@ -526,6 +529,13 @@ class Retriever:
                 else:
                     results.append(best)
                 rescued_ids.add(best["id"])
+            if rescued_ids:
+                # 保底替换后按分数重排，避免混合分高于中间名次时展示乱序
+                results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        # 清理打分管线内部字段，不泄漏到返回值（entity 是展示层公开约定，保留）
+        for r in results:
+            r.pop("_decl_mult", None)
+            r.pop("_sub_score", None)
         # 7. call graph 扩展（在主结果基础上连带召回调用关系）
         if expand_graph and results:
             fused_scores = dict(fused)
