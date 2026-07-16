@@ -1,0 +1,16 @@
+# 敏感配置 - 含 API key，禁止提交
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地索引库
+*.db
+.semantic-code-mcp/
+
+# 本地资料存档
+*.html
+*_files/
+scm_e2e_*/
