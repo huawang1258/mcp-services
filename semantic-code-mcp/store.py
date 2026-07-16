@@ -18,8 +18,12 @@ from chunker import CodeChunk
 
 # FTS5 query 至少保留长度 >= 此值的 token
 _MIN_TOKEN_LEN = 2
+# trigram 分词器要求 token 长度 >= 3 才能命中
+_TRIGRAM_MIN_TOKEN_LEN = 3
 # Call Graph 同名保护：symbol 对应的定义超过此数视为无区分度，跳过图扩展
 _MAX_SYMBOL_FANOUT = 5
+# Call Graph 热点保护：被调用方（distinct caller）超过此数的符号视为全局工具函数（日期/字符串工具等），跳过图扩展
+_MAX_CALLEE_CALLERS = 20
 
 
 class CodeStore:
@@ -36,27 +40,38 @@ class CodeStore:
         self._init_schema()
 
     @staticmethod
-    def _migrate_fts(cur) -> None:
-        """旧 FTS5 schema 迁移：如果列数不含 file_path 则重建。"""
+    def _trigram_supported(cur) -> bool:
+        """探测当前 SQLite 是否支持 FTS5 trigram 分词器（>= 3.34）。"""
         try:
-            # 检查 fts_chunks 是否已存在且列数是否正确
+            cur.execute("CREATE VIRTUAL TABLE temp.__scm_trig_probe USING fts5(x, tokenize='trigram')")
+            cur.execute("DROP TABLE temp.__scm_trig_probe")
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    @staticmethod
+    def _migrate_fts(cur) -> None:
+        """旧 FTS5 schema 迁移：列缺 file_path，或被旧版建成了 trigram（主表必须 unicode61
+        保英文精确分词，trigram 子串匹配对英文标识符查询是噪音源），则重建。"""
+        try:
+            # 检查 fts_chunks 是否已存在且列数/分词器是否正确
             row = cur.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
             ).fetchone()
-            if row and "file_path" not in row[0]:
+            if row and ("file_path" not in row[0] or "trigram" in row[0]):
                 cur.execute("DROP TABLE fts_chunks")
         except Exception:
             pass
 
     @staticmethod
-    def _rebuild_fts_if_empty(cur) -> None:
+    def _rebuild_fts_if_empty(cur, table: str = "fts_chunks") -> None:
         """FTS 表为空但 chunks 有数据时（如迁移刚 DROP 重建），从 chunks 回填。"""
         try:
             n_chunks = cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            n_fts = cur.execute("SELECT COUNT(*) FROM fts_chunks").fetchone()[0]
+            n_fts = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             if n_chunks and not n_fts:
                 cur.execute(
-                    "INSERT INTO fts_chunks (rowid, code, file_path, symbol) "
+                    f"INSERT INTO {table} (rowid, code, file_path, symbol) "
                     "SELECT id, code, file_path, symbol FROM chunks"
                 )
         except Exception:
@@ -87,8 +102,10 @@ class CodeStore:
             )
             """
         )
-        # FTS5: code + file_path + symbol 全部参与 BM25 检索
-        # 迁移：旧 schema (code, symbol) → 新 schema (code, file_path, symbol)
+        # FTS5 双表：
+        #   fts_chunks     unicode61 精确分词 —— 英文标识符查询主力（基线行为，trigram 子串匹配会引入噪音）
+        #   fts_chunks_tri trigram 子串匹配 —— 仅 CJK 查询时作为额外召回路
+        #   （unicode61 把连续汉字并成单 token，中文查询在主表上全程失效）
         self._migrate_fts(cur)
         cur.execute(
             """
@@ -97,7 +114,17 @@ class CodeStore:
             )
             """
         )
-        self._rebuild_fts_if_empty(cur)
+        self._rebuild_fts_if_empty(cur, "fts_chunks")
+        self.fts_trigram = self._trigram_supported(cur)
+        if self.fts_trigram:
+            cur.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks_tri USING fts5(
+                    code, file_path, symbol, tokenize='trigram'
+                )
+                """
+            )
+            self._rebuild_fts_if_empty(cur, "fts_chunks_tri")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -169,6 +196,11 @@ class CodeStore:
                 "INSERT INTO fts_chunks (rowid, code, file_path, symbol) VALUES (?, ?, ?, ?)",
                 (chunk_id, chunk.code, chunk.file_path, chunk.symbol),
             )
+            if self.fts_trigram:
+                cur.execute(
+                    "INSERT INTO fts_chunks_tri (rowid, code, file_path, symbol) VALUES (?, ?, ?, ?)",
+                    (chunk_id, chunk.code, chunk.file_path, chunk.symbol),
+                )
             for callee in getattr(chunk, "calls", None) or []:
                 cur.execute(
                     "INSERT INTO edges (caller_id, callee_name) VALUES (?, ?)",
@@ -187,6 +219,8 @@ class CodeStore:
             marks = ",".join("?" * len(ids))
             cur.execute(f"DELETE FROM vec_chunks WHERE rowid IN ({marks})", ids)
             cur.execute(f"DELETE FROM fts_chunks WHERE rowid IN ({marks})", ids)
+            if self.fts_trigram:
+                cur.execute(f"DELETE FROM fts_chunks_tri WHERE rowid IN ({marks})", ids)
             cur.execute(f"DELETE FROM edges WHERE caller_id IN ({marks})", ids)
             cur.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
         self.db.commit()
@@ -228,9 +262,18 @@ class CodeStore:
 
     @staticmethod
     def _fts_query(text: str) -> str | None:
-        """把自然语言 query 转为安全的 FTS5 MATCH 表达式（token OR 连接）。"""
+        """把自然语言 query 转为安全的 FTS5 MATCH 表达式（token OR 连接，unicode61 语义）。"""
         tokens = re.findall(r"\w+", text)
         tokens = [t for t in tokens if len(t) >= _MIN_TOKEN_LEN]
+        if not tokens:
+            return None
+        return " OR ".join(f'"{t}"' for t in tokens)
+
+    @staticmethod
+    def _fts_query_trigram(text: str) -> str | None:
+        """trigram 表的 MATCH 表达式：token 需 >= 3 字符；CJK 连续串整体作为 phrase（子串匹配）。"""
+        tokens = re.findall(r"\w+", text)
+        tokens = [t for t in tokens if len(t) >= _TRIGRAM_MIN_TOKEN_LEN]
         if not tokens:
             return None
         return " OR ".join(f'"{t}"' for t in tokens)
@@ -246,13 +289,30 @@ class CodeStore:
         return [(int(r[0]), float(r[1])) for r in rows]
 
     def search_fts(self, query_text: str, k: int) -> list[tuple[int, float]]:
-        """BM25 词法检索，返回 [(chunk_id, rank)]，rank 越小越相关。"""
+        """BM25 词法检索（unicode61 精确分词），返回 [(chunk_id, rank)]，rank 越小越相关。"""
         q = self._fts_query(query_text)
         if not q:
             return []
         try:
             rows = self.db.execute(
                 "SELECT rowid, rank FROM fts_chunks WHERE fts_chunks MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (q, k),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(int(r[0]), float(r[1])) for r in rows]
+
+    def search_fts_trigram(self, query_text: str, k: int) -> list[tuple[int, float]]:
+        """trigram BM25 检索（CJK 子串可匹配），仅供含 CJK 的查询作额外召回路。"""
+        if not getattr(self, "fts_trigram", False):
+            return []
+        q = self._fts_query_trigram(query_text)
+        if not q:
+            return []
+        try:
+            rows = self.db.execute(
+                "SELECT rowid, rank FROM fts_chunks_tri WHERE fts_chunks_tri MATCH ? "
                 "ORDER BY rank LIMIT ?",
                 (q, k),
             ).fetchall()
@@ -285,6 +345,23 @@ class CodeStore:
 
     # ---------- call graph ----------
 
+    def hot_callees(self, names: list[str]) -> set[str]:
+        """返回 names 中的"全局热点"符号（被调 caller 数超过 _MAX_CALLEE_CALLERS）。
+
+        热点符号（日期/字符串工具等被全库调用的函数）作为图扩展目标毫无信息量，
+        反而把关联位灌满噪音，需要过滤。
+        """
+        names = [n for n in names if n]
+        if not names:
+            return set()
+        marks = ",".join("?" * len(names))
+        rows = self.db.execute(
+            f"SELECT callee_name, COUNT(DISTINCT caller_id) FROM edges "
+            f"WHERE callee_name IN ({marks}) GROUP BY callee_name",
+            names,
+        ).fetchall()
+        return {r[0] for r in rows if int(r[1]) > _MAX_CALLEE_CALLERS}
+
     def callers_of(self, callee_name: str, limit: int = 20) -> list[dict]:
         """结构化查询：返回调用了 callee_name 的所有 chunk（按 id 去重）。
 
@@ -300,17 +377,25 @@ class CodeStore:
         chunk_map = self.get_chunks(ids)
         return [chunk_map[i] for i in ids if i in chunk_map]
 
-    def expand_graph(self, chunk_ids: list[int], symbols: list[str], limit: int = 10) -> list[dict]:
+    def expand_graph(
+        self,
+        chunk_ids: list[int],
+        symbols: list[str],
+        limit: int = 10,
+        extra_callee_names: list[str] | None = None,
+    ) -> list[dict]:
         """图扩展：返回与给定 chunk 有调用关系的相关 chunk。
 
-        callees：给定 chunk 调用的函数（edges.caller_id 命中 -> 匹配 symbol）
-        callers：调用了给定 symbol 的函数（edges.callee_name 命中 -> caller_id）
-        每条结果带 relation 字段（"callee"/"caller"）。
+        callees：给定 chunk 调用的函数（edges.caller_id 命中 -> 匹配 symbol，热点过滤）
+        callers：调用了给定 symbol / extra_callee_names 的函数（edges.callee_name 命中 -> caller_id）
+            extra_callee_names 用于类/接口级 chunk：其内部声明的方法名不是 chunk symbol，
+            由调用方提取后传入，否则 caller 方向永远查不到方法调用边。
+        每条结果带 relation 字段（"callee"/"caller"）；跨模块同名同内容副本去重。
         """
         origin = set(chunk_ids)
         related: dict[int, str] = {}  # chunk_id -> relation
 
-        # callees：这些 chunk 调用了哪些函数名 -> 找对应定义
+        # callees：这些 chunk 调用了哪些函数名 -> 找对应定义（先滤掉全局热点工具函数）
         if chunk_ids:
             marks = ",".join("?" * len(chunk_ids))
             callee_names = [
@@ -319,6 +404,9 @@ class CodeStore:
                     chunk_ids,
                 ).fetchall()
             ]
+            if callee_names:
+                hot = self.hot_callees(callee_names)
+                callee_names = [n for n in callee_names if n not in hot]
             if callee_names:
                 nmarks = ",".join("?" * len(callee_names))
                 rows = self.db.execute(
@@ -334,13 +422,17 @@ class CodeStore:
                         if cid not in origin:
                             related.setdefault(cid, "callee")
 
-        # callers：谁调用了这些 symbol
-        symbols = [s for s in symbols if s]
-        if symbols:
-            smarks = ",".join("?" * len(symbols))
+        # callers：谁调用了这些 symbol / 块内声明的方法名（热点符号跳过，防工具函数反查爆炸）
+        caller_targets = [s for s in symbols if s] + [n for n in (extra_callee_names or []) if n]
+        caller_targets = list(dict.fromkeys(caller_targets))
+        if caller_targets:
+            hot = self.hot_callees(caller_targets)
+            caller_targets = [n for n in caller_targets if n not in hot]
+        if caller_targets:
+            smarks = ",".join("?" * len(caller_targets))
             for r in self.db.execute(
                 f"SELECT DISTINCT caller_id FROM edges WHERE callee_name IN ({smarks})",
-                symbols,
+                caller_targets,
             ).fetchall():
                 cid = int(r[0])
                 if cid not in origin and cid not in related:
@@ -348,15 +440,24 @@ class CodeStore:
 
         if not related:
             return []
-        ids = list(related.keys())[:limit]
+        ids = list(related.keys())[: max(limit * 3, limit)]
         chunk_map = self.get_chunks(ids)
         out: list[dict] = []
+        seen_content: set[tuple] = set()
         for cid in ids:
             ch = chunk_map.get(cid)
-            if ch:
-                ch = dict(ch)
-                ch["relation"] = related[cid]
-                out.append(ch)
+            if not ch:
+                continue
+            # 跨模块复制的同名同内容块（api/domin 双份 DTO）只保留一份
+            key = (ch.get("symbol"), (ch.get("code") or "")[:200])
+            if key in seen_content:
+                continue
+            seen_content.add(key)
+            ch = dict(ch)
+            ch["relation"] = related[cid]
+            out.append(ch)
+            if len(out) >= limit:
+                break
         return out
 
     # ---------- 杂项 ----------

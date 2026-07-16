@@ -59,10 +59,13 @@ logger = logging.getLogger("semantic-code-mcp")
 
 mcp = FastMCP("semantic-code-mcp")
 
-# 单文件最多展示行数（控制 token 开销）
+# 单文件最多展示行数（控制 token 开销）：前几名全量，后面的递减
 _MAX_FILE_LINES = 120
+# 排名超过此名次的文件用精简行预算（越靠后相关性越低，不值得等额 token）
+_FULL_BUDGET_TOP = 3
+_MAX_FILE_LINES_TAIL = 50
 # 关联（call graph）块最多展示行数
-_MAX_RELATED_LINES = 40
+_MAX_RELATED_LINES = 25
 
 # 全局单例
 _embedder = None
@@ -98,14 +101,16 @@ def _numbered_lines(code: str, start_line: int, budget: int) -> tuple[list[str],
 
 
 def _format_file_group(idx: int, file_path: str, chunks: list[dict]) -> str:
-    """按文件聚合渲染：块按行号排序，非连续块之间用 ... 分隔。"""
+    """按文件聚合渲染：块按行号排序，非连续块之间用 ... 分隔。
+
+    分层预算：前 _FULL_BUDGET_TOP 名全量展示，之后的文件用精简预算。"""
     chunks = sorted(chunks, key=lambda c: c.get("start_line", 0))
     best = max(c.get("score", 0.0) for c in chunks)
     symbols = ", ".join(dict.fromkeys(c.get("symbol", "") for c in chunks if c.get("symbol")))
     lang = chunks[0].get("language", "")
     header = f"## {idx}. {file_path} :: {symbols} (score={best:.3f})"
     body: list[str] = []
-    budget = _MAX_FILE_LINES
+    budget = _MAX_FILE_LINES if idx <= _FULL_BUDGET_TOP else _MAX_FILE_LINES_TAIL
     prev_end: int | None = None
     for c in chunks:
         if budget <= 0:
@@ -158,12 +163,23 @@ def _format_results(results: list[dict]) -> str:
 
 
 @mcp.tool()
-async def codebase_search(information_request: str, directory_path: str, ctx: Context) -> str:
+async def codebase_search(
+    information_request: str,
+    directory_path: str,
+    ctx: Context,
+    top_n: int = 0,
+    path_filter: str = "",
+    include_related: bool = True,
+) -> str:
     """语义检索代码库，返回最相关的代码片段。
 
     Args:
         information_request: 自然语言查询，例如"用户登录鉴权逻辑在哪里"
         directory_path: 要检索的代码库绝对路径
+        top_n: 可选，返回结果数（0 = 用默认值 SCM_TOP_N，默认 10）
+        path_filter: 可选，文件路径过滤；含通配符按 glob 匹配（如 "*.java"、"**/service/**"），
+            否则按路径子串匹配（如 "controller"）
+        include_related: 可选，是否附带 call graph 关联块（调用者/被调用者），默认 True
     """
     directory = Path(directory_path).resolve()
     t0 = time.time()
@@ -200,10 +216,17 @@ async def codebase_search(information_request: str, directory_path: str, ctx: Co
 
         # 检索阶段
         top_k = int(os.getenv("SCM_TOP_K", "50"))
-        top_n = int(os.getenv("SCM_TOP_N", "10"))
+        n = top_n if top_n > 0 else int(os.getenv("SCM_TOP_N", "10"))
+        pf = path_filter.strip() or None
         results = await loop.run_in_executor(
             None,
-            lambda: ws.search(information_request, top_k=top_k, top_n=top_n),
+            lambda: ws.search(
+                information_request,
+                top_k=top_k,
+                top_n=n,
+                expand_graph=include_related,
+                path_filter=pf,
+            ),
         )
         await ctx.report_progress(100, 100)
         logger.info("[Tool] ✓ codebase_search done %.1fs results=%d", time.time() - t0, len(results))

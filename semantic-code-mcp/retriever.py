@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 
@@ -40,9 +41,10 @@ _BARREL_PENALTY = 0.85
 _NON_CODE_PENALTY = 0.8
 _NON_CODE_LANGS = {"markdown", "yaml", "json", "toml", "properties", "text"}
 _BARREL_NAMES = {"index.ts", "index.js", "index.tsx", "index.jsx", "index.mjs", "__init__.py", "mod.rs"}
-# 调用链意图："谁调用/被哪些...调用/who calls/callers of"
+# 调用链意图："谁调用/被哪些...调用/谁写入/在哪被使用/who calls/callers of/writes to"
 _CALLER_INTENT_RE = re.compile(
-    r"(谁调用|被哪些|哪些[^\s]{0,8}调用|调用了?它|callers?\s+of|who\s+calls|call\s*sites?)", re.I
+    r"(谁调用|被哪些|哪些[^\s]{0,8}调用|调用了?它|被写入|写入|谁在用|被使用|被引用"
+    r"|callers?\s+of|who\s+calls|call\s*sites?|writes?\s+to|who\s+writes|where\s+.{0,20}\bused)", re.I
 )
 # 测试意图：查询本身在找测试/基准 -> 反转测试降权为 boost
 _TEST_INTENT_RE = re.compile(r"(\btests?\b|\bspec\b|benchmark|单测|测试|用例|基准)", re.I)
@@ -56,6 +58,33 @@ _DOC_INTENT_BOOST = 1.5
 _CONFIG_INTENT_RE = re.compile(r"(config|configuration|settings|\byaml\b|\btoml\b|配置)", re.I)
 _CONFIG_LANGS = {"yaml", "toml", "properties", "json"}
 _CONFIG_INTENT_BOOST = 1.4
+# 纯声明块（Java interface / @FeignClient 契约）降权：实现优先于声明；
+# 短而密集命中查询词的接口/DTO 在三路召回里天然压过大方法体，需要纠偏
+_DECL_PENALTY = 0.85
+# 实体/DTO 块（注解驱动、无控制流）温和降权
+_ENTITY_PENALTY = 0.9
+# 查询显式找接口定义/契约时不惩罚声明块
+_DECL_INTENT_RE = re.compile(r"(接口定义|契约|declaration|signature|\binterface\b|feign)", re.I)
+# 同名接口/实现配对：结果集同时出现 X 与 XImpl 时，实现继承接口分数排到前面
+_IMPL_PAIR_FACTOR = 1.01
+_JAVA_INTERFACE_RE = re.compile(r"^\s*(?:public\s+)?(?:@\w+(?:\([^)]*\))?\s+)*interface\s+\w", re.M)
+_CONTROL_FLOW_RE = re.compile(r"\b(if|for|while|switch|return)\b")
+# 块内声明方法名提取（caller 方向图扩展用），每块最多取这么多个
+_MAX_DECL_NAMES_PER_CHUNK = 12
+_DECL_NAME_RES = {
+    "java": [
+        # 带修饰符的方法声明
+        re.compile(r"^\s*(?:public|protected|private)\s+(?:(?:static|final|synchronized|abstract|default|native)\s+)*[\w<>\[\],.\s?]+?\s+(\w+)\s*\(", re.M),
+        # 接口方法（无修饰符，; 结尾）
+        re.compile(r"^\s*[\w<>\[\],.?]+\s+(\w+)\s*\([^;{}]*\)\s*;", re.M),
+    ],
+    "python": [re.compile(r"^\s*def\s+(\w+)\s*\(", re.M)],
+    "go": [re.compile(r"^func\s+(?:\([^)]*\)\s*)?(\w+)\s*\(", re.M)],
+    "typescript": [re.compile(r"^\s*(?:public\s+|private\s+|protected\s+|export\s+|async\s+)*(\w+)\s*\([^)]*\)\s*[:{]", re.M)],
+}
+_DECL_NAME_STOP = {"if", "for", "while", "switch", "catch", "return", "new", "super", "else", "throw"}
+# CJK 字符（汉字 + 假名 + 谚文）：命中时追加 trigram 召回路
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
 
 class Retriever:
@@ -113,9 +142,19 @@ class Retriever:
         """调用链意图：命中意图模式时直查 edges 表，结构化结果置顶。"""
         if not _CALLER_INTENT_RE.search(query):
             return []
+        idents: list[str] = []
+        for ident in self._intent_symbols(query):
+            idents.append(ident)
+            # 表名 → 实体类名（tb_care_done_recent → CareDoneRecent）：
+            # edges 记录了构造类型名（new CareDoneRecent()），能直接命中写入方
+            low = ident.lower()
+            if low.startswith(("tb_", "t_")):
+                parts = [p for p in ident.split("_")[1:] if p]
+                if parts:
+                    idents.append("".join(p[:1].upper() + p[1:] for p in parts))
         hits: list[dict] = []
         seen: set[int] = set()
-        for ident in self._intent_symbols(query):
+        for ident in dict.fromkeys(idents):
             # PascalCase 类名同时按实例字段命名约定查一次
             # （Java/Spring: SignsValueEvaluator -> signsValueEvaluator，edges 记录的是接收者名）
             names = [ident]
@@ -146,6 +185,51 @@ class Retriever:
             tokens.update(cls._ident_parts(w))
         return tokens
 
+    @staticmethod
+    def _is_declaration_chunk(chunk: dict) -> bool:
+        """纯声明块：Java interface / @FeignClient 契约（TS interface 同理）。"""
+        lang = chunk.get("language") or ""
+        code = chunk.get("code") or ""
+        if lang == "java":
+            return "@FeignClient" in code or bool(_JAVA_INTERFACE_RE.search(code))
+        if lang in ("typescript", "tsx"):
+            return bool(re.match(r"\s*(?:export\s+)?interface\s", code))
+        return False
+
+    @staticmethod
+    def _is_entity_chunk(chunk: dict) -> bool:
+        """实体/DTO 块：注解驱动的纯数据载体，无控制流。"""
+        lang = chunk.get("language") or ""
+        code = chunk.get("code") or ""
+        if lang != "java":
+            return False
+        if "@TableName" in code or ("@Data" in code and "class " in code):
+            return not _CONTROL_FLOW_RE.search(code)
+        return False
+
+    @classmethod
+    def _declared_names(cls, code: str, language: str) -> list[str]:
+        """提取块内声明的方法名（类/接口级 chunk 的 symbol 只有类名，
+        caller 方向图扩展需要方法名才能匹配 edges 的调用边）。"""
+        regs = _DECL_NAME_RES.get("typescript" if language == "tsx" else language)
+        if not regs:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for rg in regs:
+            for m in rg.finditer(code):
+                n = m.group(1)
+                if len(n) < 4 or n in seen or n in _DECL_NAME_STOP:
+                    continue
+                # Java/TS 方法名小写开头，滤掉构造器/类名误匹配
+                if language in ("java", "typescript", "tsx") and n[:1].isupper():
+                    continue
+                seen.add(n)
+                names.append(n)
+                if len(names) >= _MAX_DECL_NAMES_PER_CHUNK:
+                    return names
+        return names
+
     def _name_boost(self, qtokens: set[str], chunk: dict) -> float:
         """名称信号 boost：符号完整命中强提升；符号/文件名分词命中按个数提升。"""
         if not qtokens:
@@ -168,11 +252,14 @@ class Retriever:
         expand_graph: bool = True,
         graph_limit: int = 8,
         max_per_file: int = _MAX_PER_FILE,
+        path_filter: str | None = None,
     ) -> list[dict]:
         """检索并返回 top_n 个代码块（dict，含 score）。
 
         排序管线：向量+BM25 召回 → RRF → rerank（可选）→ 调用链意图置顶 →
         意图感知降权/boost + 名称 boost → 文件多样性截断（每文件最多 max_per_file 块）。
+
+        path_filter：可选文件路径过滤，含通配符按 glob 匹配，否则按子串匹配。
 
         expand_graph=True 时，在主结果基础上沿 call graph 扩展 1 跳，
         把调用者/被调用者作为关联结果附加（带 relation 字段）。
@@ -200,6 +287,13 @@ class Retriever:
                 h_emb = self.embedder.embed_documents([hyde])[0]
                 rank_lists.append([cid for cid, _ in self.store.search_vector(h_emb, top_k)])
                 weights.append(1.0)
+        # 2.8 CJK 查询追加 trigram 召回路（unicode61 把连续汉字并成单 token，主 FTS 路对中文失效；
+        #     纯英文查询不走 trigram，避免子串匹配稀释标识符精确信号）
+        if _CJK_RE.search(query):
+            tri_list = [cid for cid, _ in self.store.search_fts_trigram(query, top_k)]
+            if tri_list:
+                rank_lists.append(tri_list)
+                weights.append(weights[0])
         # 3. RRF 融合（仅用排名）
         fused = self._rrf(rank_lists, weights=weights)
         if not fused:
@@ -234,6 +328,7 @@ class Retriever:
         test_intent = bool(_TEST_INTENT_RE.search(query))
         doc_intent = bool(_DOC_INTENT_RE.search(query))
         config_intent = bool(_CONFIG_INTENT_RE.search(query))
+        decl_intent = bool(_DECL_INTENT_RE.search(query))
         for c in candidates:
             mult = 1.0
             fp = c.get("file_path", "")
@@ -242,14 +337,33 @@ class Retriever:
             if self._is_barrel_file(fp):
                 mult *= _BARREL_PENALTY
             mult *= self._noncode_mult(c.get("language", ""), doc_intent, config_intent)
+            if not decl_intent:
+                if self._is_declaration_chunk(c):
+                    mult *= _DECL_PENALTY
+                elif self._is_entity_chunk(c):
+                    mult *= _ENTITY_PENALTY
             mult *= self._name_boost(qtokens, c)
             c["score"] *= mult
+        # 5.5 接口/实现配对：XImpl 继承同名 X（接口）的更高分，实现排到声明前面
+        best_by_symbol: dict[str, float] = {}
+        for c in candidates:
+            sym = c.get("symbol") or ""
+            if sym:
+                best_by_symbol[sym] = max(best_by_symbol.get(sym, 0.0), c["score"])
+        for c in candidates:
+            sym = c.get("symbol") or ""
+            if sym.endswith("Impl") and len(sym) > 4:
+                base = best_by_symbol.get(sym[:-4])
+                if base and base > c["score"]:
+                    c["score"] = base * _IMPL_PAIR_FACTOR
         candidates.sort(key=lambda x: x["score"], reverse=True)
         # 6. 文件多样性：同一文件最多 max_per_file 块，避免 top_n 被单文件刷屏
         results: list[dict] = []
         per_file: dict[str, int] = {}
         for c in candidates:
             fp = c.get("file_path", "")
+            if path_filter and not self._path_match(fp, path_filter):
+                continue
             if max_per_file > 0 and per_file.get(fp, 0) >= max_per_file:
                 continue
             per_file[fp] = per_file.get(fp, 0) + 1
@@ -258,22 +372,55 @@ class Retriever:
                 break
         # 7. call graph 扩展（在主结果基础上连带召回调用关系）
         if expand_graph and results:
-            results = self._with_graph(results, graph_limit)
+            fused_scores = dict(fused)
+            results = self._with_graph(results, graph_limit, fused_scores)
         return results
 
-    def _with_graph(self, results: list[dict], limit: int) -> list[dict]:
-        """在主结果后附加 call graph 关联块（去重，带 relation 标记）。"""
+    def _with_graph(
+        self, results: list[dict], limit: int, fused_scores: dict[int, float] | None = None
+    ) -> list[dict]:
+        """在主结果后附加 call graph 关联块（去重，带 relation 标记）。
+
+        关联块按主召回融合分排序（在召回列表里出现过 = 与查询相关），
+        同分 caller 优先于 callee（调用点对溯源/影响面分析更有价值）。
+        类/接口级块额外提取内部声明的方法名参与 caller 反查。"""
         origin_ids = [r["id"] for r in results if "id" in r]
         symbols = [r.get("symbol", "") for r in results]
-        related = self.store.expand_graph(origin_ids, symbols, limit=limit)
+        extra_names: list[str] = []
+        for r in results:
+            extra_names.extend(self._declared_names(r.get("code") or "", r.get("language") or ""))
+        related = self.store.expand_graph(
+            origin_ids, symbols, limit=limit * 3, extra_callee_names=extra_names
+        )
+        fused_scores = fused_scores or {}
+        related.sort(
+            key=lambda r: (
+                fused_scores.get(r.get("id"), 0.0),
+                1 if r.get("relation") == "caller" else 0,
+            ),
+            reverse=True,
+        )
         existing = set(origin_ids)
+        added = 0
         for r in related:
             if r["id"] in existing:
                 continue
             r["score"] = 0.0  # 图扩展块无 relevance 分，靠 relation 标记
             results.append(r)
             existing.add(r["id"])
+            added += 1
+            if added >= limit:
+                break
         return results
+
+    @staticmethod
+    def _path_match(file_path: str, pattern: str) -> bool:
+        """路径过滤：含通配符按 glob（对全路径，自动补 **/ 前缀），否则子串包含。"""
+        fp = file_path.replace("\\", "/")
+        pat = pattern.replace("\\", "/")
+        if any(ch in pat for ch in "*?["):
+            return fnmatch.fnmatch(fp, pat) or fnmatch.fnmatch(fp, f"*{pat}" if not pat.startswith("*") else pat)
+        return pat.lower() in fp.lower()
 
     @staticmethod
     def _rrf(
