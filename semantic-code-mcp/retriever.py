@@ -10,10 +10,11 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import time
 
 from embedder import Embedder
 from expander import create_expander
-from store import CodeStore
+from store import CodeStore, _is_boilerplate_symbol
 
 try:
     import cohere
@@ -25,6 +26,21 @@ except Exception:  # 依赖缺失不阻断
 _RRF_K = 60
 # 送入 rerank 的单文档最大字符数
 _RERANK_DOC_MAX_CHARS = 4000
+# rerank 429 限速重试：次数与退避基数（Cohere 试用 key 10 次/分钟，
+# 静默降级会让排序质量随机劣化，退避重试把调用速率压回限额内）
+_RERANK_MAX_RETRIES = 2
+_RERANK_BACKOFF_S = 6.0
+
+
+def _rerank_min_interval() -> float:
+    """rerank 调用最小间隔（秒），0 = 不节流。懒读 env：评测等密集场景
+    用它把速率压到试用 key 限额内，生产零星查询不受影响。"""
+    try:
+        return float(os.getenv("SCM_RERANK_MIN_INTERVAL", "0") or 0)
+    except ValueError:
+        return 0.0
+
+
 # 测试文件 score 惩罚系数（实现优先于测试）
 _TEST_FILE_PENALTY = 0.5
 # 测试文件名模式
@@ -60,9 +76,9 @@ _CONFIG_LANGS = {"yaml", "toml", "properties", "json"}
 _CONFIG_INTENT_BOOST = 1.4
 # 纯声明块（Java interface / @FeignClient 契约）降权：实现优先于声明；
 # 短而密集命中查询词的接口/DTO 在三路召回里天然压过大方法体，需要纠偏
-_DECL_PENALTY = 0.85
-# 实体/DTO 块（注解驱动、无控制流）温和降权
-_ENTITY_PENALTY = 0.9
+_DECL_PENALTY = 0.75
+# 实体/DTO 块（注解驱动、无控制流）降权
+_ENTITY_PENALTY = 0.85
 # 查询显式找接口定义/契约时不惩罚声明块
 _DECL_INTENT_RE = re.compile(r"(接口定义|契约|declaration|signature|\binterface\b|feign)", re.I)
 # 同名接口/实现配对：结果集同时出现 X 与 XImpl 时，实现继承接口分数排到前面
@@ -85,6 +101,13 @@ _DECL_NAME_RES = {
 _DECL_NAME_STOP = {"if", "for", "while", "switch", "catch", "return", "new", "super", "else", "throw"}
 # CJK 字符（汉字 + 假名 + 谚文）：命中时追加 trigram 召回路
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+# 复合意图查询拆分：CJK 连接词 / 加号（"生成+清理"、"生成和清理"）。
+# 英文 and 不拆：英文复合名词短语（error wrapping and logging）拆开反而稀释信号
+_COMPOUND_SPLIT_RE = re.compile(r"[+＋]|(?<=[\u4e00-\u9fff])(?:和|与|以及)(?=[\u4e00-\u9fff])")
+# 拆分后子查询最短长度（去空白）；2 覆盖中文双字动词（"生成"/"清理"）
+_COMPOUND_MIN_LEN = 2
+# 子查询召回路权重（低于主查询，防拆分噪声反客为主）
+_COMPOUND_SUB_WEIGHT = 0.7
 
 
 class Retriever:
@@ -103,6 +126,7 @@ class Retriever:
         self.rerank_model = rerank_model
         key = rerank_api_key or os.getenv("COHERE_API_KEY")
         self.cohere_client = cohere.Client(key) if (key and cohere) else None
+        self._last_rerank_ts = 0.0
         # 查询扩展（HyDE + 多查询变体）：默认按 SCM_QUERY_EXPANSION 开关创建
         self.expander = expander if expander is not None else create_expander()
 
@@ -224,6 +248,9 @@ class Retriever:
                 # Java/TS 方法名小写开头，滤掉构造器/类名误匹配
                 if language in ("java", "typescript", "tsx") and n[:1].isupper():
                     continue
+                # accessor/样板方法不参与 caller 反查（"谁调用了 setRemark"是纯噪音）
+                if _is_boilerplate_symbol(n):
+                    continue
                 seen.add(n)
                 names.append(n)
                 if len(names) >= _MAX_DECL_NAMES_PER_CHUNK:
@@ -294,6 +321,19 @@ class Retriever:
             if tri_list:
                 rank_lists.append(tri_list)
                 weights.append(weights[0])
+        # 2.9 复合意图拆分（"生成+清理"）：单次向量召回对双动作查询天然偏科，
+        #     各子查询独立召回后低权重并入 RRF，两个意图都能拿到席位
+        for sub in self._compound_subqueries(query):
+            s_emb = self.embedder.embed_query(sub)
+            rank_lists.append([cid for cid, _ in self.store.search_vector(s_emb, top_k)])
+            weights.append(_COMPOUND_SUB_WEIGHT)
+            sub_fts = (
+                self.store.search_fts_trigram(sub, top_k)
+                if _CJK_RE.search(sub) else self.store.search_fts(sub, top_k)
+            )
+            if sub_fts:
+                rank_lists.append([cid for cid, _ in sub_fts])
+                weights.append(_COMPOUND_SUB_WEIGHT)
         # 3. RRF 融合（仅用排名）
         fused = self._rrf(rank_lists, weights=weights)
         if not fused:
@@ -337,10 +377,14 @@ class Retriever:
             if self._is_barrel_file(fp):
                 mult *= _BARREL_PENALTY
             mult *= self._noncode_mult(c.get("language", ""), doc_intent, config_intent)
+            is_decl = self._is_declaration_chunk(c)
+            is_entity = not is_decl and self._is_entity_chunk(c)
+            if is_entity:
+                c["entity"] = True  # 展示层据此收紧行预算（DTO 字段列表不值得全量吐）
             if not decl_intent:
-                if self._is_declaration_chunk(c):
+                if is_decl:
                     mult *= _DECL_PENALTY
-                elif self._is_entity_chunk(c):
+                elif is_entity:
                     mult *= _ENTITY_PENALTY
             mult *= self._name_boost(qtokens, c)
             c["score"] *= mult
@@ -406,12 +450,21 @@ class Retriever:
             if r["id"] in existing:
                 continue
             r["score"] = 0.0  # 图扩展块无 relevance 分，靠 relation 标记
+            if self._is_entity_chunk(r):
+                r["entity"] = True
             results.append(r)
             existing.add(r["id"])
             added += 1
             if added >= limit:
                 break
         return results
+
+    @staticmethod
+    def _compound_subqueries(query: str) -> list[str]:
+        """复合意图查询拆分：恰好拆成两段且每段足够长才生效（保守策略，防误拆）。"""
+        parts = [p.strip() for p in _COMPOUND_SPLIT_RE.split(query)]
+        parts = [p for p in parts if len(p) >= _COMPOUND_MIN_LEN]
+        return parts if len(parts) == 2 else []
 
     @staticmethod
     def _path_match(file_path: str, pattern: str) -> bool:
@@ -438,12 +491,27 @@ class Retriever:
 
     def _rerank(self, query: str, candidates: list[dict], top_n: int) -> list[dict]:
         docs = [self._doc_text(c) for c in candidates]
-        resp = self.cohere_client.rerank(
-            model=self.rerank_model,
-            query=query,
-            documents=docs,
-            top_n=min(top_n, len(docs)),
-        )
+        min_interval = _rerank_min_interval()
+        resp = None
+        for attempt in range(_RERANK_MAX_RETRIES + 1):
+            if min_interval > 0:
+                wait = self._last_rerank_ts + min_interval - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+            try:
+                self._last_rerank_ts = time.time()
+                resp = self.cohere_client.rerank(
+                    model=self.rerank_model,
+                    query=query,
+                    documents=docs,
+                    top_n=min(top_n, len(docs)),
+                )
+                break
+            except Exception as e:
+                # 仅对限速重试（退避后速率回到限额内）；其它异常继续抛给外层降级 RRF
+                if "TooManyRequests" not in type(e).__name__ or attempt >= _RERANK_MAX_RETRIES:
+                    raise
+                time.sleep(_RERANK_BACKOFF_S * (attempt + 1))
         out: list[dict] = []
         for r in resp.results:
             ch = dict(candidates[r.index])

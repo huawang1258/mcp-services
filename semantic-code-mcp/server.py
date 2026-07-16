@@ -63,9 +63,11 @@ mcp = FastMCP("semantic-code-mcp")
 _MAX_FILE_LINES = 120
 # 排名超过此名次的文件用精简行预算（越靠后相关性越低，不值得等额 token）
 _FULL_BUDGET_TOP = 3
-_MAX_FILE_LINES_TAIL = 50
+_MAX_FILE_LINES_TAIL = 40
+# 实体/DTO 块单块上限：字段列表看前几十行足够，140 行全量吐是浪费
+_MAX_ENTITY_LINES = 30
 # 关联（call graph）块最多展示行数
-_MAX_RELATED_LINES = 25
+_MAX_RELATED_LINES = 20
 
 # 全局单例
 _embedder = None
@@ -128,7 +130,8 @@ def _format_file_group(idx: int, file_path: str, chunks: list[dict]) -> str:
                     continue
                 code = "\n".join(code_lines)
                 start = prev_end + 1
-        lines, used = _numbered_lines(code, start, budget)
+        chunk_budget = min(budget, _MAX_ENTITY_LINES) if c.get("entity") else budget
+        lines, used = _numbered_lines(code, start, chunk_budget)
         body.extend(lines)
         budget -= used
         prev_end = max(prev_end or 0, c.get("end_line", start + used - 1))

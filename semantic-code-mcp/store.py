@@ -24,6 +24,18 @@ _TRIGRAM_MIN_TOKEN_LEN = 3
 _MAX_SYMBOL_FANOUT = 5
 # Call Graph 热点保护：被调用方（distinct caller）超过此数的符号视为全局工具函数（日期/字符串工具等），跳过图扩展
 _MAX_CALLEE_CALLERS = 20
+# Java bean 访问器模式（getX/setX/isX）：作为图扩展目标零信息量，纯噪音
+_ACCESSOR_RE = re.compile(r"^(?:get|set|is)[A-Z]\w*$")
+# 语言级样板方法名：同理跳过
+_BOILERPLATE_NAMES = {
+    "toString", "equals", "hashCode", "clone", "compareTo",
+    "builder", "build", "valueOf", "readObject", "writeObject",
+}
+
+
+def _is_boilerplate_symbol(name: str) -> bool:
+    """accessor / 样板方法：不值得作为 call graph 扩展的目标或反查起点。"""
+    return bool(_ACCESSOR_RE.match(name)) or name in _BOILERPLATE_NAMES
 
 
 class CodeStore:
@@ -390,6 +402,7 @@ class CodeStore:
         callers：调用了给定 symbol / extra_callee_names 的函数（edges.callee_name 命中 -> caller_id）
             extra_callee_names 用于类/接口级 chunk：其内部声明的方法名不是 chunk symbol，
             由调用方提取后传入，否则 caller 方向永远查不到方法调用边。
+        两个方向都过滤 accessor / 样板方法（setRemark 这类 bean setter 是纯噪音）。
         每条结果带 relation 字段（"callee"/"caller"）；跨模块同名同内容副本去重。
         """
         origin = set(chunk_ids)
@@ -404,6 +417,7 @@ class CodeStore:
                     chunk_ids,
                 ).fetchall()
             ]
+            callee_names = [n for n in callee_names if n and not _is_boilerplate_symbol(n)]
             if callee_names:
                 hot = self.hot_callees(callee_names)
                 callee_names = [n for n in callee_names if n not in hot]
@@ -424,7 +438,7 @@ class CodeStore:
 
         # callers：谁调用了这些 symbol / 块内声明的方法名（热点符号跳过，防工具函数反查爆炸）
         caller_targets = [s for s in symbols if s] + [n for n in (extra_callee_names or []) if n]
-        caller_targets = list(dict.fromkeys(caller_targets))
+        caller_targets = [n for n in dict.fromkeys(caller_targets) if not _is_boilerplate_symbol(n)]
         if caller_targets:
             hot = self.hot_callees(caller_targets)
             caller_targets = [n for n in caller_targets if n not in hot]
