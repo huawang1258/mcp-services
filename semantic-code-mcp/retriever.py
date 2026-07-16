@@ -122,6 +122,14 @@ _COMPOUND_SUB_WEIGHT = 0.7
 # 前 N 名文件与最终结果零交集（完全无代表）；保底块必须来自已过
 # RRF 候选门槛的 candidates（全库 top-1 直插会把"清理"这种宽泛词的噪声带进来）
 _COMPOUND_PROBE_TOP = 10
+# 子查询 rerank 分数混合：探针块用整句 rerank 分天然吃亏（"清理 100 天"
+# 在整句里只占小半权重），单独用子查询文本再 rerank 一次，
+# 最终分取 max(整句分, 子查询分 × 此系数)
+_COMPOUND_SUB_RERANK_MIX = 0.9
+# 子查询分参与混合/保底的最低门槛：实测"清理"这种宽泛短词的字面命中
+# （clearCache/clear 工具方法）全部 ≤0.14，真业务清理实现 ≥0.22，
+# 0.2 是天然分界线；低于门槛的子查询信号不参与任何提分
+_COMPOUND_SUB_MIN_SCORE = 0.2
 
 
 class Retriever:
@@ -337,8 +345,9 @@ class Retriever:
                 weights.append(weights[0])
         # 2.9 复合意图拆分（"生成+清理"）：单次向量召回对双动作查询天然偏科，
         #     各子查询独立召回后低权重并入 RRF，两个意图都能拿到席位
-        sub_probes: list[list[int]] = []  # 每个子查询自己的前 N 名（保底探针用）
-        for sub in self._compound_subqueries(query):
+        subs = self._compound_subqueries(query)
+        sub_probes: list[list[int]] = []  # 每个子查询自己的前 N 名（保底探针/分数混合用）
+        for sub in subs:
             s_emb = self.embedder.embed_query(sub)
             sub_lists = [[cid for cid, _ in self.store.search_vector(s_emb, top_k)]]
             sub_fts = (
@@ -368,11 +377,43 @@ class Retriever:
                 candidates.append(ch)
         # 4. rerank（可选，失败降级为 RRF 分数）；多取候选给后续多样性截断留余量
         if self.cohere_client and candidates:
+            pre_rerank = {c.get("id"): c for c in candidates}
             try:
                 rerank_n = min(len(candidates), max(top_n * 3, 20))
                 candidates = self._rerank(query, candidates, rerank_n)
             except Exception:
                 pass
+            # 4.1 整句 rerank 截断会把整句分低的探针块丢掉，补回（0 分起步，
+            #     等 4.2 子查询分数拉起），否则分数混合和保底都看不见它
+            if sub_probes:
+                out_ids = {c.get("id") for c in candidates}
+                for cid in dict.fromkeys(cid for p in sub_probes for cid in p):
+                    if cid in pre_rerank and cid not in out_ids:
+                        ch = pre_rerank[cid]
+                        ch["score"] = 0.0
+                        candidates.append(ch)
+            # 4.2 子查询分数混合：探针块单独用子查询文本 rerank，取 max 混入。
+            #     整句 rerank 把子意图文档压到 0.2x（语义重心在主意图），
+            #     子查询文本打分才能反映它对那半意图的真实相关性
+            if subs and sub_probes:
+                by_id = {c.get("id"): c for c in candidates}
+                for sub, probe in zip(subs, sub_probes):
+                    sub_cands = [by_id[cid] for cid in probe if cid in by_id]
+                    if not sub_cands:
+                        continue
+                    try:
+                        scored = self._rerank(sub, sub_cands, len(sub_cands))
+                    except Exception:
+                        continue
+                    for s in scored:
+                        c = by_id.get(s.get("id"))
+                        if c is None:
+                            continue
+                        c["_sub_score"] = max(c.get("_sub_score", 0.0), s["score"])
+                        if s["score"] >= _COMPOUND_SUB_MIN_SCORE:
+                            c["score"] = max(
+                                c["score"], s["score"] * _COMPOUND_SUB_RERANK_MIX
+                            )
         # 4.5 调用链意图：结构化命中注入高分（并入统一打分管线，测试调用方会被后续降权拆开）
         intent_hits = self._caller_intent_hits(query)
         if intent_hits:
@@ -445,8 +486,9 @@ class Retriever:
             if len(results) >= top_n:
                 break
         # 6.5 子查询保底：某子意图召回的前 N 名文件与结果零交集（完全无代表）时，
-        #     从 candidates 里按探针名次挑一块替换当前最低分名额，防 rerank 用
-        #     完整 query 重打分把子意图抹平；已有代表则不动（避免顶掉更相关结果）
+        #     从 candidates 里挑子查询 rerank 分最高且达门槛的块替换最低分名额；
+        #     无达标块则放弃（"清理"这种宽泛词的 clearCache 字面命中不配强插）；
+        #     已有代表则不动（避免顶掉更相关结果）
         if sub_probes and results:
             by_id = {c.get("id"): c for c in candidates}
             probe_ids = [cid for p in sub_probes for cid in p]
@@ -459,26 +501,31 @@ class Retriever:
                 }
                 if result_files & probe_files:
                     continue  # 该子意图已有代表
-                for cid in probe:
-                    ch = by_id.get(cid)
-                    if not ch or cid in rescued_ids:
-                        continue  # 只保底过了候选门槛的块，全库 top-1 噪声不直插
-                    fp = ch.get("file_path", "")
-                    if path_filter and not self._path_match(fp, path_filter):
+                best = max(
+                    (
+                        by_id[cid] for cid in probe
+                        if cid in by_id and cid not in rescued_ids
+                        and by_id[cid].get("_sub_score", 0.0) >= _COMPOUND_SUB_MIN_SCORE
+                        and not (path_filter and not self._path_match(
+                            by_id[cid].get("file_path", ""), path_filter))
+                    ),
+                    key=lambda c: c.get("_sub_score", 0.0),
+                    default=None,
+                )
+                if best is None:
+                    continue
+                if len(results) >= top_n:
+                    low = min(
+                        (i for i, r in enumerate(results) if r.get("id") not in rescued_ids),
+                        key=lambda i: results[i].get("score", 0.0),
+                        default=None,
+                    )
+                    if low is None:
                         continue
-                    if len(results) >= top_n:
-                        low = min(
-                            (i for i, r in enumerate(results) if r.get("id") not in rescued_ids),
-                            key=lambda i: results[i].get("score", 0.0),
-                            default=None,
-                        )
-                        if low is None:
-                            break
-                        results[low] = ch
-                    else:
-                        results.append(ch)
-                    rescued_ids.add(cid)
-                    break
+                    results[low] = best
+                else:
+                    results.append(best)
+                rescued_ids.add(best["id"])
         # 7. call graph 扩展（在主结果基础上连带召回调用关系）
         if expand_graph and results:
             fused_scores = dict(fused)
