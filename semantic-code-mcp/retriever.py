@@ -105,9 +105,13 @@ _DECL_NAME_RES = {
 _DECL_NAME_STOP = {"if", "for", "while", "switch", "catch", "return", "new", "super", "else", "throw"}
 # CJK 字符（汉字 + 假名 + 谚文）：命中时追加 trigram 召回路
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-# 复合意图查询拆分：CJK 连接词 / 加号（"生成+清理"、"生成和清理"）。
+# 复合意图查询拆分：CJK 连接词 / 加号（"生成+清理"、"生成并清理"）。
+# 长词优先（以及/并且/同时 先于 和/与/并/及）；"合并""并发"类词素误拆由
+# 两段最短长度 + 子查询低权重兼容（主查询权重不变，RRF 容错）。
 # 英文 and 不拆：英文复合名词短语（error wrapping and logging）拆开反而稀释信号
-_COMPOUND_SPLIT_RE = re.compile(r"[+＋]|(?<=[\u4e00-\u9fff])(?:和|与|以及)(?=[\u4e00-\u9fff])")
+_COMPOUND_SPLIT_RE = re.compile(
+    r"[+＋]|(?<=[\u4e00-\u9fff])(?:以及|并且|同时|和|与|并|及)(?=[\u4e00-\u9fff])"
+)
 # 拆分后子查询最短长度（去空白）；2 覆盖中文双字动词（"生成"/"清理"）
 _COMPOUND_MIN_LEN = 2
 # 子查询召回路权重（低于主查询，防拆分噪声反客为主）
@@ -388,23 +392,33 @@ class Retriever:
                 c["entity"] = True  # 展示层据此收紧行预算（DTO 字段列表不值得全量吐）
             if not decl_intent:
                 if is_decl:
-                    mult *= _DECL_PENALTY * (_IMPL_INTENT_EXTRA if impl_intent else 1.0)
+                    # 记住降权系数：接口-实现配对要用降权前的分数做 base，
+                    # 否则声明降权把 base 一起拉低，配对提拔失效
+                    c["_decl_mult"] = _DECL_PENALTY * (_IMPL_INTENT_EXTRA if impl_intent else 1.0)
+                    mult *= c["_decl_mult"]
                 elif is_entity:
                     mult *= _ENTITY_PENALTY * (_IMPL_INTENT_EXTRA if impl_intent else 1.0)
             mult *= self._name_boost(qtokens, c)
             c["score"] *= mult
-        # 5.5 接口/实现配对：XImpl 继承同名 X（接口）的更高分，实现排到声明前面
-        best_by_symbol: dict[str, float] = {}
+        # 5.5 接口/实现配对（文件级）：接口块 symbol 是类名、实现块 symbol 是方法名，
+        # 按 symbol 配不上；改按文件 stem 配对：XImpl.java 的最高分块继承 X.java
+        # （接口文件）的更高分，实现方法排到接口声明前面
+        best_by_stem: dict[str, float] = {}
         for c in candidates:
-            sym = c.get("symbol") or ""
-            if sym:
-                best_by_symbol[sym] = max(best_by_symbol.get(sym, 0.0), c["score"])
+            undecl = c["score"] / c.get("_decl_mult", 1.0)
+            best_by_stem[self._file_stem(c)] = max(
+                best_by_stem.get(self._file_stem(c), 0.0), undecl
+            )
+        impl_top: dict[str, dict] = {}  # stem -> 该实现文件最高分块
         for c in candidates:
-            sym = c.get("symbol") or ""
-            if sym.endswith("Impl") and len(sym) > 4:
-                base = best_by_symbol.get(sym[:-4])
-                if base and base > c["score"]:
-                    c["score"] = base * _IMPL_PAIR_FACTOR
+            stem = self._file_stem(c)
+            if stem.endswith("Impl") and len(stem) > 4:
+                if stem not in impl_top or c["score"] > impl_top[stem]["score"]:
+                    impl_top[stem] = c
+        for stem, c in impl_top.items():
+            base = best_by_stem.get(stem[:-4])
+            if base and base > c["score"]:
+                c["score"] = base * _IMPL_PAIR_FACTOR
         candidates.sort(key=lambda x: x["score"], reverse=True)
         # 6. 文件多样性：同一文件最多 max_per_file 块，避免 top_n 被单文件刷屏
         results: list[dict] = []
@@ -470,6 +484,12 @@ class Retriever:
         parts = [p.strip() for p in _COMPOUND_SPLIT_RE.split(query)]
         parts = [p for p in parts if len(p) >= _COMPOUND_MIN_LEN]
         return parts if len(parts) == 2 else []
+
+    @staticmethod
+    def _file_stem(chunk: dict) -> str:
+        """文件名去扩展名（CareServiceImpl.java -> CareServiceImpl）。"""
+        fp = chunk.get("file_path") or ""
+        return fp.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].split(".")[0]
 
     @staticmethod
     def _path_match(file_path: str, pattern: str) -> bool:

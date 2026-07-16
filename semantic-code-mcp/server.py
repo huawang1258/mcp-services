@@ -66,6 +66,11 @@ _FULL_BUDGET_TOP = 3
 _MAX_FILE_LINES_TAIL = 40
 # 实体/DTO 块单块上限：字段列表看前几十行足够，140 行全量吐是浪费
 _MAX_ENTITY_LINES = 30
+# 任意单块上限：类级大块（整个 Service 类头几百行）价值密度低，
+# 单块吃满文件预算会挤掉同文件其它命中块
+_MAX_CHUNK_LINES = 80
+# 单行最大字符数：builder 链/SQL 拼接行能到几百字符，截尾不影响理解
+_MAX_LINE_CHARS = 200
 # 关联（call graph）块最多展示行数
 _MAX_RELATED_LINES = 20
 
@@ -92,10 +97,13 @@ _RELATION_LABEL = {"callee": "\u2192 \u88ab\u8c03\u7528", "caller": "\u2190 \u8c
 
 
 def _numbered_lines(code: str, start_line: int, budget: int) -> tuple[list[str], int]:
-    """把代码渲染为带行号的行列表，超出预算截断。返回 (行列表, 消耗行数)。"""
+    """把代码渲染为带行号的行列表，超出预算截断，超长行截尾。返回 (行列表, 消耗行数)。"""
     code_lines = code.split("\n")
     take = code_lines[:budget]
-    out = [f"{start_line + i:>6}\t{line}" for i, line in enumerate(take)]
+    out = [
+        f"{start_line + i:>6}\t" + (l if len(l) <= _MAX_LINE_CHARS else l[:_MAX_LINE_CHARS] + " …")
+        for i, l in enumerate(take)
+    ]
     omitted = len(code_lines) - len(take)
     if omitted > 0:
         out.append(f"... ({omitted} more lines)")
@@ -130,7 +138,7 @@ def _format_file_group(idx: int, file_path: str, chunks: list[dict]) -> str:
                     continue
                 code = "\n".join(code_lines)
                 start = prev_end + 1
-        chunk_budget = min(budget, _MAX_ENTITY_LINES) if c.get("entity") else budget
+        chunk_budget = min(budget, _MAX_ENTITY_LINES if c.get("entity") else _MAX_CHUNK_LINES)
         lines, used = _numbered_lines(code, start, chunk_budget)
         body.extend(lines)
         budget -= used
