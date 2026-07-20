@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""50 条分类 golden set 检索质量评测（方法论对齐《干翻A狗》性能测试报告）。
+"""50 条分类 golden set 检索质量评测。
 
 目标仓库：CLIProxyAPI（真实中型 Go 仓库）。
 10 个类别 × 5 条：
@@ -41,7 +41,9 @@ from store import CodeStore
 
 load_dotenv()
 
-TARGET = Path(r"D:\project\main\CLIProxyAPI")
+# 评测目标：CLIProxyAPI（github.com/router-for-me/CLIProxyAPI，clone 后用
+# SCM_EVAL_TARGET 指向本地路径即可复现）
+TARGET = Path(os.getenv("SCM_EVAL_TARGET", r"D:\project\main\CLIProxyAPI"))
 TOP_N = 10
 BACKEND = "local" if "--backend" in sys.argv and "local" in sys.argv else "voyage"
 EXPAND = "--expand" in sys.argv
@@ -175,28 +177,14 @@ CAT_NAMES = {
     "F": "SDK边界", "G": "协议契约", "H": "测试fixtures", "I": "中文查询", "J": "细节实现",
 }
 
-# ---------- K 类：中文 Java 业务仓库探针（五轮外部 AI 评价修复的回归安全网） ----------
-# expected 用文件名子串匹配（Java 包路径太深）；expected_all 要求全部进 Top-5。
-# 这组 query 的措辞和期望均在真实仓库逐条验证过，改措辞前先跑探针确认。
-JAVA_TARGET = Path(r"d:\shulian\saas\clife-senior-health")
-JAVA_GOLDEN: list[dict] = [
-    # 复合双意图：主意图（定时任务入口）+ 子意图（清理实现）都要在 Top-5；
-    # 链路：拆分 → 子查询召回 → rerank 分数混合 → 门槛保底
-    {"cat": "K", "query": "XXL-Job定时任务每天生成照护任务记录并清理过期数据",
-     "expected_all": ["CareTimeJobHandler.java", "CareDoneRecentServiceImpl.java"],
-     "must_contain": ["deleteCareDoneRecent", "careDoneRecent"]},
-    # 宽泛短词拆分（"清理"）：门槛要挡住 clearCache/clear 字面噪声，
-    # 业务实现仍须在 Top-5
-    {"cat": "K", "query": "近期任务的生成并清理",
-     "expected": ["CareDoneRecentServiceImpl.java"]},
-    # 实现意图（"怎么...生成"）：实体/声明降权后实现代码优先
-    {"cat": "K", "query": "入住办理后照护任务是怎么生成的",
-     "expected": ["CareServiceImpl.java", "CareDetailServiceImpl.java"]},
-    # 精确业务定位（非复合）：trigram 中文召回 + rerank 直中
-    {"cat": "K", "query": "清理100天前的照护任务过期数据在哪实现",
-     "expected": ["CareDoneRecentServiceImpl.java"],
-     "must_contain": ["deleteCareDoneRecent"]},
-]
+# ---------- K 类：本地私有业务仓库探针（回归安全网，不随仓库分发） ----------
+# 探针定义在 gitignore 的 eval_local_probes.py（PROBE_TARGET + PROBE_GOLDEN）；
+# 文件不存在时 K 类自动跳过，其它机器/CI 零依赖。探针写法见该文件 docstring。
+try:
+    from eval_local_probes import PROBE_TARGET as JAVA_TARGET, PROBE_GOLDEN as JAVA_GOLDEN
+except ImportError:
+    JAVA_TARGET = None
+    JAVA_GOLDEN = []
 
 
 def _rel(fp: str) -> str:
@@ -235,6 +223,9 @@ def _run_java_probes() -> list[dict]:
     DB 定位规则与 server.WorkspaceManager 一致；sha256(路径|dtype)[:16]。
     不存在（其它机器/未索引）则跳过，不烧配额不阻断主评测。
     """
+    if JAVA_TARGET is None:
+        print("\n[K 类] 跳过：本地探针集不存在（eval_local_probes.py，不随仓库分发）")
+        return []
     # 复合 query 每条多发 1-2 次子查询 rerank，独立调用本函数时同样要节流
     os.environ.setdefault("SCM_RERANK_MIN_INTERVAL", "6.2")
     embedder = create_embedder()

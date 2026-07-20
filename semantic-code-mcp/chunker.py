@@ -93,8 +93,8 @@ CALL_NODE_TYPES = {
 # call 节点中“被调用名”可能所在的字段（type 覆盖 Java/C# 的 object_creation_expression）
 _CALL_NAME_FIELDS = ("function", "name", "method", "macro", "constructor", "type")
 # 成员调用的接收者字段（如 Java method_invocation 的 object）：
-# 记录接收者标识符，支持“谁调用了 SignsValueEvaluator”类意图查询
-# （Java 写法 signsValueEvaluator.evaluate() 里类名不出现在方法名中）
+# 记录接收者标识符，支持“谁调用了 PriceRuleEvaluator”类意图查询
+# （Java 写法 priceRuleEvaluator.evaluate() 里类名不出现在方法名中）
 _CALL_RECEIVER_FIELDS = ("object", "receiver")
 # 标识符类叶子节点（被调用名的末端）
 _NAME_LEAF_TYPES = {

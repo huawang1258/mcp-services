@@ -4,9 +4,7 @@
 
 「效果优先」技术栈：**Tree-sitter AST 切分 + voyage-code-3 embedding（int8 量化）+ sqlite-vec 向量库 + BM25 全文 + RRF 融合 + Cohere rerank + Call Graph 图扩展**。
 
-工程特性（对齐 augment-context-mcp）：**watchdog 文件实时监控 + 多工作区 LRU 管理 + MCP progress notification + cancel signal**。
-
-> 设计依据见 `../semantic-retrieval-research/README.md`（Augment ACE 剖析与自建方案）。
+工程特性：**watchdog 文件实时监控 + 多工作区 LRU 管理 + MCP progress notification + cancel signal**。
 
 ## 架构
 
@@ -118,7 +116,7 @@ pip install -r requirements.txt
 
 - **阶段 1** ✅：Tree-sitter + voyage-code-3 + hybrid + rerank —— 第一梯队 RAG
 - **阶段 2** ✅：Call Graph 图扩展（caller/callee 连带召回）+ int8 量化向量（存储省 71%，一致率 95%）
-- **阶段 3** ✅：工程对齐 augment-context-mcp —— watchdog 文件监控 + 多工作区 LRU + progress + cancel
+- **阶段 3** ✅：工程化 —— watchdog 文件监控 + 多工作区 LRU + progress + cancel
 - **阶段 4** ✅（部分）：意图感知排序（调用链直查 edges / 测试意图 / 文档意图）+ 文档配置索引（AGENTS.md 豁免 gitignore）+ 50 条分类评测集
 - **阶段 5** ✅：单工具化 + 后台主动增量同步 + 分阶段进度条日志 + Java 调用链（接收者边/构造类型名/泛型剥离）+ 配置意图（yaml 反转 boost）
   + 并发 embedding 流水线（worker 只跑网络调用，sqlite 写回留在调用线程，顺序写回；CLIProxyAPI 9067 块全量 77s，≈串行 3 倍）
@@ -138,9 +136,11 @@ pip install -r requirements.txt
 | 答案可用性 | 100% | 80% |
 | MRR | 0.897 | — |
 
-附加 **K 类中文 Java 业务探针**（不计入主总分）：真实业务仓库上验证复合意图拆分/
+附加 **K 类私有业务仓库探针**（不计入主总分）：在真实业务仓库上验证复合意图拆分/
 子查询分数混合/保底、trigram 中文召回、实现意图降权、`expand_graph=True` 全链路。
-依赖本机已索引的生产 DB，不存在自动跳过（`--skip-java` 显式跳过）。
+探针定义在 gitignore 的 `eval_local_probes.py`（`PROBE_TARGET` + `PROBE_GOLDEN`，
+写法见 `eval_golden.py` 的 K 类加载段），不存在自动跳过（`--skip-java` 显式跳过）——
+你可以对自己的仓库建一组同格式探针作为私有回归安全网。
 
 复测：`python eval_golden.py --json`；回归测试：`python test_fixes.py`
 

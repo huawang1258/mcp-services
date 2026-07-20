@@ -197,8 +197,8 @@ class Retriever:
         idents: list[str] = []
         for ident in self._intent_symbols(query):
             idents.append(ident)
-            # 表名 → 实体类名（tb_care_done_recent → CareDoneRecent）：
-            # edges 记录了构造类型名（new CareDoneRecent()），能直接命中写入方
+            # 表名 → 实体类名（tb_order_item → OrderItem）：
+            # edges 记录了构造类型名（new OrderItem()），能直接命中写入方
             low = ident.lower()
             if low.startswith(("tb_", "t_")):
                 parts = [p for p in ident.split("_")[1:] if p]
@@ -208,7 +208,7 @@ class Retriever:
         seen: set[int] = set()
         for ident in dict.fromkeys(idents):
             # PascalCase 类名同时按实例字段命名约定查一次
-            # （Java/Spring: SignsValueEvaluator -> signsValueEvaluator，edges 记录的是接收者名）
+            # （Java/Spring: OrderValidator -> orderValidator，edges 记录的是接收者名）
             names = [ident]
             if ident[:1].isupper():
                 names.append(ident[:1].lower() + ident[1:])
@@ -596,7 +596,7 @@ class Retriever:
 
     @staticmethod
     def _file_stem(chunk: dict) -> str:
-        """文件名去扩展名（CareServiceImpl.java -> CareServiceImpl）。"""
+        """文件名去扩展名（OrderServiceImpl.java -> OrderServiceImpl）。"""
         fp = chunk.get("file_path") or ""
         return fp.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].split(".")[0]
 

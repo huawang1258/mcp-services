@@ -226,10 +226,10 @@ def test_caller_intent_and_barrel() -> None:
     with open(java_fp, "w", encoding="utf-8") as f:
         f.write(
             "public class Svc {\n"
-            "    private final SignsValueEvaluator signsValueEvaluator = new SignsValueEvaluator();\n"
+            "    private final PriceRuleEvaluator priceRuleEvaluator = new PriceRuleEvaluator();\n"
             "    public void run(String v) {\n"
             "        java.util.List<CustomItem> items = new java.util.ArrayList<CustomItem>();\n"
-            "        EvaluateResult r = signsValueEvaluator.evaluate(1, 2, v, null, null);\n"
+            "        EvaluateResult r = priceRuleEvaluator.evaluate(1, 2, v, null, null);\n"
             "        process(r);\n"
             "    }\n"
             "}\n"
@@ -237,15 +237,15 @@ def test_caller_intent_and_barrel() -> None:
     jchunks = chunk_file(java_fp)
     jcalls = [c for ch in jchunks for c in ch.calls]
     assert "evaluate" in jcalls, jcalls
-    assert "signsValueEvaluator" in jcalls, f"接收者名应进 edges: {jcalls}"
-    assert "SignsValueEvaluator" in jcalls, f"new 类名应进 edges: {jcalls}"
+    assert "priceRuleEvaluator" in jcalls, f"接收者名应进 edges: {jcalls}"
+    assert "PriceRuleEvaluator" in jcalls, f"new 类名应进 edges: {jcalls}"
     assert "ArrayList" in jcalls, f"泛型构造应记主类型名: {jcalls}"
     assert "CustomItem" not in jcalls, f"泛型实参不应进 edges: {jcalls}"
     store = CodeStore(os.path.join(tmpdir, "t.db"), 8)
     store.add_chunks(jchunks, [[random.random() for _ in range(8)] for _ in jchunks])
     r = Retriever.__new__(Retriever)
     r.store = store
-    hits = r._caller_intent_hits("谁调用了 SignsValueEvaluator")
+    hits = r._caller_intent_hits("谁调用了 PriceRuleEvaluator")
     assert hits and any("Svc.java" in h["file_path"] for h in hits), \
         f"PascalCase 意图应通过 lowerCamel 接收者命中调用方: {[h.get('symbol') for h in hits]}"
     store.close()

@@ -29,3 +29,6 @@ debug-*.js
 test.js
 *-backup.js
 
+
+# 已拆为独立开源仓库（嵌套 git repo）
+semantic-code-mcp/
