@@ -24,6 +24,14 @@ const AUTO_RANGE_STEPS = [
   { range: 24 * 60 * 60 * 1000,      label: '24 小时' },
 ];
 
+// 递进总预算（毫秒）：避免多步累计超过 MCP 请求兑底超时（60s）
+const AUTO_RANGE_BUDGET = 45000;
+
+/** 超时类错误识别（兼容 TIMEOUT/timeout/超时/504） */
+function isTimeoutError(msg) {
+  return /timeout|超时|504/i.test(msg || '');
+}
+
 // ============================================================
 // 核心查询
 // ============================================================
@@ -104,8 +112,9 @@ export async function queryLoki(envName, expr, options = {}) {
     const data = await resp.json();
     return parseLokiResponse(data);
   } catch (e) {
-    if (e.name === 'AbortError') {
-      // 区分原因：用户 cancel vs 超时
+    // abort(reason) 时 fetch 抛出的可能是 reason 本身（message='TIMEOUT'/'USER_CANCELLED'），
+    // 也可能是 AbortError，统一按 signal 状态区分原因
+    if (e.name === 'AbortError' || controller.signal.aborted) {
       if (userSignal && userSignal.aborted) {
         const err = new Error('CANCELLED');
         err.name = 'AbortError';
@@ -136,34 +145,51 @@ export async function queryLoki(envName, expr, options = {}) {
  * @returns {Object} { logs, labels, traceIds, stats, timeRange: { label, from, to } }
  */
 export async function queryLokiAutoRange(envName, expr, options = {}) {
-  // 如果用户明确指定了 from/to，直接查询不递进
-  if (options.from && options.to) {
-    log(`[Loki] 使用指定时间范围查询: ${new Date(options.from).toLocaleString()} ~ ${new Date(options.to).toLocaleString()}`);
+  // 只要指定了 from 就走固定范围（to 缺省取当前时间），不递进
+  if (options.from) {
+    const to = options.to || Date.now();
+    log(`[Loki] 使用指定时间范围查询: ${new Date(options.from).toLocaleString()} ~ ${new Date(to).toLocaleString()}`);
     try {
-      const result = await queryLoki(envName, expr, options);
-      result.timeRange = { label: '自定义', from: options.from, to: options.to };
+      const result = await queryLoki(envName, expr, { ...options, to });
+      result.timeRange = { label: '指定范围', from: options.from, to };
       return result;
     } catch (e) {
-      const isTimeout = e.message.includes('timeout') || e.message.includes('504') || e.message.includes('Timeout');
+      const isTimeout = isTimeoutError(e.message);
       log(`[Loki] ❌ 指定时间范围查询${isTimeout ? '超时' : '失败'}: ${e.message.substring(0, 200)}`);
       return {
         logs: [], labels: [], traceIds: [], stats: null,
-        timeRange: { label: '自定义', from: options.from, to: options.to },
+        timeRange: { label: '指定范围', from: options.from, to },
         notFound: true,
         error: isTimeout
-          ? '查询超时（数据量过大），请缩小时间范围或指定具体服务'
+          ? '指定范围查询超时（该时间窗内数据量过大），请缩小 from/to 窗口后重试'
           : `查询失败: ${e.message.substring(0, 200)}`
       };
     }
   }
 
-  // 自动递进：从小范围到大范围
+  // 自动递进：从小范围到大范围（总预算 AUTO_RANGE_BUDGET，避免撞 MCP 60s 兑底超时）
   const now = Date.now();
+  const startedAt = Date.now();
+  const tried = [];
   for (const step of AUTO_RANGE_STEPS) {
     const from = now - step.range;
     const to = now;
 
+    // 总预算检查：剩余时间不足以支撑一次查询时停止递进
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > AUTO_RANGE_BUDGET - 5000) {
+      log(`[Loki] ⏱ 递进总耗时 ${elapsed}ms 接近预算，停止在 ${tried.join(' → ') || '(未开始)'}`);
+      return {
+        logs: [], labels: [], traceIds: [], stats: null,
+        timeRange: { label: tried[tried.length - 1] || '未开始', from: null, to: null },
+        notFound: true,
+        triedLabels: tried,
+        error: `已搜索 ${tried.join(' → ')} 范围未找到，更大范围因耗时预算未尝试。建议用 from/to 指定具体时间窗查询`
+      };
+    }
+
     log(`[Loki] 自动递进: 尝试 ${step.label} 范围...`);
+    tried.push(step.label);
 
     try {
       const result = await queryLoki(envName, expr, { ...options, from, to });
@@ -171,21 +197,23 @@ export async function queryLokiAutoRange(envName, expr, options = {}) {
       if (result.logs.length > 0) {
         log(`[Loki] ✅ 在 ${step.label} 范围内找到 ${result.logs.length} 行日志`);
         result.timeRange = { label: step.label, from, to };
+        result.triedLabels = tried;
         return result;
       }
 
       log(`[Loki] ⏭️ ${step.label} 范围内无结果，扩大范围...`);
     } catch (e) {
       // 查询超时或失败，停止递进，返回优雅降级结果
-      const isTimeout = e.message.includes('timeout') || e.message.includes('504') || e.message.includes('Timeout');
+      const isTimeout = isTimeoutError(e.message);
       log(`[Loki] ⚠️ ${step.label} 范围查询${isTimeout ? '超时' : '失败'}: ${e.message.substring(0, 200)}`);
       return {
         logs: [], labels: [], traceIds: [], stats: null,
         timeRange: { label: step.label, from, to },
         notFound: true,
+        triedLabels: tried,
         error: isTimeout
-          ? `查询在递进到 ${step.label} 范围时超时（数据量过大），请缩小时间范围或指定具体服务查询`
-          : `查询在递进到 ${step.label} 范围时失败: ${e.message.substring(0, 200)}`
+          ? `${step.label} 范围查询超时（该服务日志量大，已完成 ${tried.slice(0, -1).join(' → ') || '无'} 范围搜索未命中）。建议用 from/to 指定更精确的时间窗查询`
+          : `查询在 ${step.label} 范围失败: ${e.message.substring(0, 200)}`
       };
     }
   }
@@ -198,6 +226,7 @@ export async function queryLokiAutoRange(envName, expr, options = {}) {
     traceIds: [],
     stats: null,
     timeRange: { label: '未找到', from: null, to: null },
+    triedLabels: tried,
     notFound: true
   };
 }
@@ -391,9 +420,19 @@ export function buildServiceLogQL(project, servicePodPattern, keyword = '', envN
 
   let expr = `{filename="${filename}"}`;
   if (keyword) {
-    expr += ` |= \`${keyword}\``;
+    expr += keywordFilter(keyword);
   }
   return expr;
+}
+
+/**
+ * 根据关键词形态选择 line filter：
+ * - 含正则元字符（| ( ) [ ] 等）→ |~ 正则匹配（支持 a|b 多关键词）
+ * - 纯字面量 → |= 子串匹配（Loki 快一个量级，大日志量服务不易超时）
+ */
+function keywordFilter(keyword) {
+  const hasRegexMeta = /[|()\[\]{}.*+?^$\\]/.test(keyword);
+  return hasRegexMeta ? ` |~ \`${keyword}\`` : ` |= \`${keyword}\``;
 }
 
 /**
@@ -412,10 +451,10 @@ export function buildProjectLogQL(project, keyword, envName = '') {
 
   if (hasProject) {
     // CMS: 直接用 project 标签，高效精确
-    return `{project="${project}"} |= \`${keyword}\``;
+    return `{project="${project}"}${keywordFilter(keyword)}`;
   } else {
     // 私有化: 用 filename 正则匹配所有 clife-{project}-* 服务的 normal.log
-    return `{filename=~"/data/services/logs/clife-${project}-.*normal.log"} |= \`${keyword}\``;
+    return `{filename=~"/data/services/logs/clife-${project}-.*normal.log"}${keywordFilter(keyword)}`;
   }
 }
 

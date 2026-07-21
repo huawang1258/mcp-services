@@ -485,7 +485,10 @@ async function handleToolCall(name, args, signal) {
 
           if (lokiResult.logs.length === 0) {
             const errorHint = lokiResult.error ? `\n\n⚠️ **${lokiResult.error}**` : '';
-            return { content: [{ type: 'text', text: `## ${args.service} 日志 (${envKey} 生产环境)\n\n⚠️ 已自动搜索 5分钟 → 30分钟 → 1小时 → 3小时 → 24小时 范围，均未找到日志。${errorHint}\n\n请确认：\n1. 服务名是否正确\n2. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
+            const rangeDesc = lokiResult.triedLabels && lokiResult.triedLabels.length > 0
+              ? `已搜索 ${lokiResult.triedLabels.join(' → ')} 范围`
+              : `已搜索${lokiResult.timeRange.label}`;
+            return { content: [{ type: 'text', text: `## ${args.service} 日志 (${envKey} 生产环境)\n\n⚠️ ${rangeDesc}，未找到日志。${errorHint}\n\n请确认：\n1. 服务名是否正确\n2. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
           }
 
           let text = `## ${args.service} 日志 (${envKey} 生产环境, ${lokiResult.timeRange.label}内, ${lokiResult.logs.length} 行)\n\n`;
@@ -540,7 +543,10 @@ async function handleToolCall(name, args, signal) {
 
           if (lokiResult.logs.length === 0) {
             const errorHint = lokiResult.error ? `\n\n⚠️ **${lokiResult.error}**` : '';
-            return { content: [{ type: 'text', text: `## ${args.service} 日志搜索结果 (${envKey} 生产环境)\n\n**关键词**: ${keyword}\n\n⚠️ 已自动搜索 5分钟 → 30分钟 → 1小时 → 3小时 → 24小时 范围，均未找到匹配内容。${errorHint}\n\n请确认：\n1. 关键词是否正确\n2. 服务名是否正确\n3. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
+            const rangeDesc = lokiResult.triedLabels && lokiResult.triedLabels.length > 0
+              ? `已搜索 ${lokiResult.triedLabels.join(' → ')} 范围`
+              : `已搜索${lokiResult.timeRange.label}`;
+            return { content: [{ type: 'text', text: `## ${args.service} 日志搜索结果 (${envKey} 生产环境)\n\n**关键词**: ${keyword}\n\n⚠️ ${rangeDesc}，未找到匹配内容。${errorHint}\n\n请确认：\n1. 关键词是否正确（纯字面量用子串匹配；含 | ( ) 等元字符时按正则匹配）\n2. 服务名是否正确\n3. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
           }
 
           let text = `## ${args.service} 日志搜索结果 (${envKey} 生产环境, ${lokiResult.timeRange.label}内)\n\n`;
