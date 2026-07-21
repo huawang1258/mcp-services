@@ -111,9 +111,16 @@ function parseLokiFilename(filename, pathProject) {
   return { serviceName: stripDirSuffix(dirName), dirName, logSubPath };
 }
 
-/** clife-senior-health-app -> clife-senior-health；fulfill-center 原样返回 */
+/** clife-senior-health-app -> clife-senior-health；fulfill-center 原样返回（后缀集与 loki-client.parseServiceFromFilename 保持一致） */
 function stripDirSuffix(dirName) {
-  return dirName.replace(/-(app|service)$/, '');
+  return dirName.replace(/-(app|service|start)$/, '');
+}
+
+/** namespace 防呆校验：只允许 k8s 合法字符，防拼接进 shell 的意外输入 */
+function assertSafeNamespace(ns) {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(ns)) {
+    throw new Error(`非法 namespace: ${ns}`);
+  }
 }
 
 /**
@@ -214,6 +221,7 @@ function matchInRegistry(registry, nameOrAlias, staticName) {
  * @returns {string[]} deployment 名列表
  */
 export async function discoverK8sDeployments(namespace, signal) {
+  assertSafeNamespace(namespace);
   const cacheKey = `k8s-deploy:${namespace}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
@@ -246,6 +254,7 @@ export async function discoverK8sDeployments(namespace, signal) {
  * @returns {{logPath, logFile}|null}
  */
 async function probeLogTarget(namespace, podPattern, serviceBase, signal) {
+  assertSafeNamespace(namespace);
   const cacheKey = `k8s-probe:${namespace}:${podPattern}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
@@ -301,9 +310,12 @@ async function probeLogTarget(namespace, podPattern, serviceBase, signal) {
  * @param {string} nameOrAlias - 服务名/别名
  * @param {string|null} namespace - 指定 namespace（null 用默认）
  * @param {AbortSignal} [signal]
+ * @param {Object} [options]
+ * @param {boolean} [options.skipProbe] - 跳过 pod 内日志路径探测（trace_log 全量扫描等批量场景，
+ *   每次探测是一次 SSH exec 往返 3-5s，批量时改用约定路径猜测）
  * @returns {Object|null} 服务配置对象（结构同 SERVICES 条目，动态发现的带 discovered: true）
  */
-export async function resolveK8sService(nameOrAlias, namespace, signal) {
+export async function resolveK8sService(nameOrAlias, namespace, signal, options = {}) {
   // 1. 静态配置命中
   const staticSvc = findService(nameOrAlias, namespace);
   if (staticSvc) return staticSvc;
@@ -326,17 +338,18 @@ export async function resolveK8sService(nameOrAlias, namespace, signal) {
   const deployment = matches.sort((a, b) => a.length - b.length)[0];
   const serviceBase = deploymentBaseName(deployment, ns);
 
-  // 3. 探测日志路径（按服务基名匹配共享卷里的目录）
-  let target;
-  try {
-    target = await probeLogTarget(ns, deployment, serviceBase, signal);
-  } catch (e) {
-    log(`[Discovery] 日志路径探测失败 (${deployment}): ${e.message.substring(0, 120)}`);
-    target = null;
+  // 3. 探测日志路径（按服务基名匹配共享卷里的目录；批量场景 skipProbe 直接猜测）
+  let target = null;
+  if (!options.skipProbe) {
+    try {
+      target = await probeLogTarget(ns, deployment, serviceBase, signal);
+    } catch (e) {
+      log(`[Discovery] 日志路径探测失败 (${deployment}): ${e.message.substring(0, 120)}`);
+    }
   }
 
   if (!target) {
-    // 探测失败按约定猜路径：/www/logs/{serviceBase}/normal_logs/normal.log
+    // 探测失败/跳过探测按约定猜路径：/www/logs/{serviceBase}/normal_logs/normal.log
     target = { logPath: `/www/logs/${serviceBase}/normal_logs`, logFile: 'normal.log' };
   }
 

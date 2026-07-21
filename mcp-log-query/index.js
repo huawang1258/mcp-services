@@ -40,6 +40,11 @@ import { resolveLokiTarget, resolveK8sService, getAllServiceNames } from './serv
 const REQUEST_TIMEOUT = 60000;             // MCP 请求兑底超时 60s（withTimeout 强制终止）
 const WATCHDOG_WARN_TIMEOUT = 120000;      // 看门狗 120s，仅记录告警（不再 process.exit）
 
+/** shell 双引号内安全转义：处理 \\ " $ ` ，防 grep 关键词破坏命令结构 */
+function escapeShellArg(s) {
+  return String(s).replace(/[\\"$`]/g, '\\$&');
+}
+
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -574,7 +579,7 @@ async function handleToolCall(name, args, signal) {
         const caseSensitive = args.case_sensitive || false;
 
         const grepFlags = caseSensitive ? '' : '-i';
-        const command = `grep ${grepFlags} -C ${contextLines} "${keyword}"`;
+        const command = `grep ${grepFlags} -C ${parseInt(contextLines) || 5} "${escapeShellArg(keyword)}"`;
 
         log(`[MCP] 搜索日志: ${service.name} (namespace: ${service.namespace}), 关键词: ${keyword}`);
         const result = await queryLog(service, command, { signal });
@@ -807,11 +812,12 @@ async function handleToolCall(name, args, signal) {
             break;
           }
 
-          const service = await resolveK8sService(serviceName, targetNamespace, signal);
+          // 批量扫描跳过 pod 内探测（每次探测 = 一次 SSH 往返，几十个服务会烧光预算），动态服务用约定路径
+          const service = await resolveK8sService(serviceName, targetNamespace, signal, { skipProbe: true });
           if (!service) { searched++; continue; }
 
           try {
-            const command = `grep -i -C ${contextLines} "${traceId}"`;
+            const command = `grep -i -C ${parseInt(contextLines) || 3} "${escapeShellArg(traceId)}"`;
             const result = await queryLog(service, command, { timeout: TRACE_PER_SERVICE, signal });
 
             if (result && result.trim() && !result.includes('未找到')) {

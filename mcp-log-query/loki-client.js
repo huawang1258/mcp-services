@@ -429,10 +429,16 @@ export function buildServiceLogQL(project, servicePodPattern, keyword = '', envN
  * 根据关键词形态选择 line filter：
  * - 含正则元字符（| ( ) [ ] 等）→ |~ 正则匹配（支持 a|b 多关键词）
  * - 纯字面量 → |= 子串匹配（Loki 快一个量级，大日志量服务不易超时）
+ * 字符串形式：默认 backtick（无转义语义）；关键词本身含反引号时切双引号并转义
  */
 function keywordFilter(keyword) {
   const hasRegexMeta = /[|()\[\]{}.*+?^$\\]/.test(keyword);
-  return hasRegexMeta ? ` |~ \`${keyword}\`` : ` |= \`${keyword}\``;
+  const op = hasRegexMeta ? '|~' : '|=';
+  if (keyword.includes('`')) {
+    const escaped = keyword.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return ` ${op} "${escaped}"`;
+  }
+  return ` ${op} \`${keyword}\``;
 }
 
 /**
