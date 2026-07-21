@@ -15,6 +15,88 @@
 
 import { Client } from 'ssh2';
 import { JUMP_HOST, K8S_SERVER, DEFAULTS } from './config.js';
+import { log } from './logger.js';
+
+// ============================================================
+// 并发信号量：防止同时打开过多堡垒机会话被踢
+// ============================================================
+const SSH_MAX_CONCURRENT = parseInt(process.env.SSH_MAX_CONCURRENT || '3', 10);
+const SSH_QUEUE_MAX = parseInt(process.env.SSH_QUEUE_MAX || '50', 10);
+// 排队等待最长时间（毫秒），防止前面请求卡死后面无限等
+const SSH_ACQUIRE_TIMEOUT = parseInt(process.env.SSH_ACQUIRE_TIMEOUT || '60000', 10);
+
+const _sshSem = {
+  active: 0,
+  queue: [],
+  max: SSH_MAX_CONCURRENT,
+  queueMax: SSH_QUEUE_MAX,
+};
+
+/**
+ * 获取 SSH 信号量槽位
+ * @param {number} [timeoutMs] - 排队超时（默认 60s），防止无限等
+ * @param {AbortSignal} [signal] - 用户 cancel 信号，abort 时立即从队列移除并 reject
+ * @returns {Promise<void>}
+ */
+function sshAcquire(timeoutMs = SSH_ACQUIRE_TIMEOUT, signal) {
+  if (signal && signal.aborted) {
+    return Promise.reject(new Error('CANCELLED before SSH acquire'));
+  }
+  if (_sshSem.active < _sshSem.max) {
+    _sshSem.active++;
+    log(`[SSH-Sem] acquire 直接通过 (active=${_sshSem.active}/${_sshSem.max}, queue=${_sshSem.queue.length})`);
+    return Promise.resolve();
+  }
+  if (_sshSem.queue.length >= _sshSem.queueMax) {
+    return Promise.reject(new Error(`SSH 并发队列已满（>${_sshSem.queueMax}），请稍后重试`));
+  }
+  log(`[SSH-Sem] acquire 进入排队 (active=${_sshSem.active}/${_sshSem.max}, queue=${_sshSem.queue.length + 1}, timeout=${timeoutMs}ms)`);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let onAbort;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    };
+    const enterQueue = () => {
+      if (settled) return; // 已超时/已取消，放弃并立刻腾位给下一个
+      settled = true;
+      cleanup();
+      _sshSem.active++;
+      log(`[SSH-Sem] acquire 出队获得槽位 (active=${_sshSem.active}/${_sshSem.max}, queue=${_sshSem.queue.length})`);
+      resolve();
+    };
+    _sshSem.queue.push(enterQueue);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const idx = _sshSem.queue.indexOf(enterQueue);
+      if (idx >= 0) _sshSem.queue.splice(idx, 1);
+      log(`[SSH-Sem] acquire 排队超时 (${timeoutMs}ms, active=${_sshSem.active}/${_sshSem.max}, queue=${_sshSem.queue.length})`);
+      reject(new Error(`SSH 排队等待超时 (${timeoutMs}ms)：前面请求卡住，或并发过高。可调整 SSH_MAX_CONCURRENT / SSH_ACQUIRE_TIMEOUT`));
+    }, timeoutMs);
+    // 用户 cancel：立即从队列移除
+    onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const idx = _sshSem.queue.indexOf(enterQueue);
+      if (idx >= 0) _sshSem.queue.splice(idx, 1);
+      log(`[SSH-Sem] acquire 用户 cancel，从队列移除 (active=${_sshSem.active}/${_sshSem.max}, queue=${_sshSem.queue.length})`);
+      reject(new Error('CANCELLED in SSH queue'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function sshRelease() {
+  _sshSem.active = Math.max(0, _sshSem.active - 1);
+  // 超时的 entry 已在 timer 里从 queue 移除，这里 shift 到的都是活的
+  const next = _sshSem.queue.shift();
+  if (next) next();
+  log(`[SSH-Sem] release (active=${_sshSem.active}/${_sshSem.max}, queue=${_sshSem.queue.length})`);
+}
 
 /**
  * 执行日志查询
@@ -25,8 +107,11 @@ import { JUMP_HOST, K8S_SERVER, DEFAULTS } from './config.js';
  */
 export async function queryLog(service, command, options = {}) {
   const timeout = options.timeout || DEFAULTS.timeout;
+  const signal = options.signal;
 
-  return new Promise((resolve, reject) => {
+  await sshAcquire(undefined, signal);
+  try {
+    return await new Promise((resolve, reject) => {
     const conn = new Client();
     let buffer = '';  // 累积所有输出
     let timeoutId;
@@ -34,32 +119,49 @@ export async function queryLog(service, command, options = {}) {
     let kubectlOutput = '';
     let collectingOutput = false;
 
-    // 设置超时
+    // 设置超时 - 使用 destroy() 强制关闭
+    let settled = false;
     timeoutId = setTimeout(() => {
-      conn.end();
-      reject(new Error(`命令执行超时 (${timeout}ms)`));
+      if (!settled) {
+        settled = true;
+        try { conn.destroy(); } catch {};
+        reject(new Error(`命令执行超时 (${timeout}ms)`));
+      }
     }, timeout);
 
-    conn.on('ready', () => {
-      console.error('[SSH] 已连接到堡垒机');
+    // 用户 cancel：立即 destroy 连接
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      log(`[SSH] ⊗ 用户 cancel，destroy 连接 (${service.name})`);
+      try { conn.destroy(); } catch {};
+      reject(new Error('CANCELLED during SSH'));
+    };
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
+    conn.on('ready', () => {
       conn.shell({ term: 'xterm', rows: 24, cols: 500 }, (err, stream) => {
         if (err) {
           clearTimeout(timeoutId);
-          reject(err);
+          if (!settled) { settled = true; reject(err); }
           return;
         }
 
         stream.on('close', () => {
           clearTimeout(timeoutId);
-          conn.end();
-
-          // 清理输出
-          const cleanOutput = cleanTerminalOutput(kubectlOutput || buffer);
-          resolve(cleanOutput);
+          try { conn.destroy(); } catch {}
+          if (!settled) {
+            settled = true;
+            resolve(cleanTerminalOutput(kubectlOutput || buffer));
+          }
         });
 
         stream.on('data', (data) => {
+          if (settled) return; // 已超时，忽略后续数据
           const text = data.toString();
           buffer += text;
 
@@ -67,64 +169,43 @@ export async function queryLog(service, command, options = {}) {
             kubectlOutput += text;
           }
 
-          // JumpServer 状态机 - 检查累积的 buffer
-
-          // 阶段1: 等待 Opt> 提示符
+          // JumpServer 状态机
           if (stage === 'init' && buffer.includes('Opt>')) {
             stage = 'opt';
-            console.error('[SSH] 输入目标服务器 IP');
             stream.write(K8S_SERVER.host + '\r');
           }
-          // 阶段2: 等待 [Host]> 提示符（搜索结果列表后）
           else if (stage === 'opt' && buffer.includes('[Host]>')) {
             stage = 'host';
-            console.error('[SSH] 选择服务器 ID: ' + K8S_SERVER.selectOption);
             stream.write(K8S_SERVER.selectOption + '\r');
           }
-          // 阶段3: 等待进入服务器 shell（检测 ~]$ 或 ~]# 提示符）
           else if (stage === 'host' && (buffer.includes('~]$') || buffer.includes('~]#'))) {
             stage = 'server';
-            console.error('[SSH] 已进入服务器，执行 kubectl 命令');
-
-            // 构建并执行 kubectl 命令
             const kubectlCmd = buildKubectlCommand(service, command);
-            console.error(`[SSH] 命令: ${kubectlCmd.substring(0, 80)}...`);
-
-            // 重置 buffer，开始收集 kubectl 输出
             kubectlOutput = '';
             collectingOutput = true;
-
             stream.write(kubectlCmd + '\r');
             stage = 'kubectl';
           }
-          // 阶段4: kubectl 执行完成
           else if (stage === 'kubectl' && collectingOutput && kubectlOutput.length > 50) {
-            // 检测命令执行完成（返回到 shell 提示符）
             if (kubectlOutput.includes('~]$') || kubectlOutput.includes('~]#')) {
               stage = 'done';
               collectingOutput = false;
-              console.error('[SSH] 命令执行完成，退出');
-
-              // 立即退出
               stream.write('exit\r');
               stream.write('exit\r');
-              setTimeout(() => stream.end(), 500);
+              setTimeout(() => { try { stream.end(); } catch {} }, 300);
             }
           }
         });
 
-        stream.stderr.on('data', (data) => {
-          console.error('[SSH stderr]', data.toString());
-        });
+        stream.stderr.on('data', () => {});
       });
     });
 
     conn.on('error', (err) => {
       clearTimeout(timeoutId);
-      reject(new Error(`SSH 连接错误: ${err.message}`));
+      if (!settled) { settled = true; reject(new Error(`SSH 连接错误: ${err.message}`)); }
     });
 
-    // 连接堡垒机
     conn.connect({
       host: JUMP_HOST.host,
       port: JUMP_HOST.port,
@@ -133,6 +214,9 @@ export async function queryLog(service, command, options = {}) {
       readyTimeout: DEFAULTS.connectTimeout
     });
   });
+  } finally {
+    sshRelease();
+  }
 }
 
 /**
@@ -145,8 +229,6 @@ function buildKubectlCommand(service, logCommand) {
   const file = logFile || 'normal.log';
   const fullPath = `${logPath}/${file}`;
 
-  // 构建完整命令
-  // 例如: kubectl exec pod/xxx -n namespace -- tail -100 /path/to/normal.log
   return `kubectl exec $(kubectl get pod -n ${namespace} -o name | grep ${podPattern} | head -1) -n ${namespace} -- ${logCommand} ${fullPath}`;
 }
 
@@ -218,8 +300,11 @@ export async function testConnection() {
  */
 export async function executeKubectl(kubectlCommand, options = {}) {
   const timeout = options.timeout || DEFAULTS.timeout;
+  const signal = options.signal;
 
-  return new Promise((resolve, reject) => {
+  await sshAcquire(undefined, signal);
+  try {
+    return await new Promise((resolve, reject) => {
     const conn = new Client();
     let buffer = '';
     let timeoutId;
@@ -227,32 +312,49 @@ export async function executeKubectl(kubectlCommand, options = {}) {
     let kubectlOutput = '';
     let collectingOutput = false;
 
-    // 设置超时
+    // 设置超时 - 使用 destroy() 强制关闭
+    let settled = false;
     timeoutId = setTimeout(() => {
-      conn.end();
-      reject(new Error(`命令执行超时 (${timeout}ms)`));
+      if (!settled) {
+        settled = true;
+        try { conn.destroy(); } catch {}
+        reject(new Error(`命令执行超时 (${timeout}ms)`));
+      }
     }, timeout);
 
-    conn.on('ready', () => {
-      console.error('[SSH] 已连接到堡垒机');
+    // 用户 cancel：立即 destroy 连接
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      log(`[SSH] ⊗ 用户 cancel，destroy 连接 (kubectl: ${kubectlCommand.substring(0, 50)}...)`);
+      try { conn.destroy(); } catch {};
+      reject(new Error('CANCELLED during kubectl'));
+    };
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
+    conn.on('ready', () => {
       conn.shell({ term: 'xterm', rows: 24, cols: 500 }, (err, stream) => {
         if (err) {
           clearTimeout(timeoutId);
-          reject(err);
+          if (!settled) { settled = true; reject(err); }
           return;
         }
 
         stream.on('close', () => {
           clearTimeout(timeoutId);
-          conn.end();
-
-          // 清理输出
-          const cleanOutput = cleanTerminalOutput(kubectlOutput || buffer);
-          resolve(cleanOutput);
+          try { conn.destroy(); } catch {}
+          if (!settled) {
+            settled = true;
+            resolve(cleanTerminalOutput(kubectlOutput || buffer));
+          }
         });
 
         stream.on('data', (data) => {
+          if (settled) return;
           const text = data.toString();
           buffer += text;
 
@@ -261,60 +363,41 @@ export async function executeKubectl(kubectlCommand, options = {}) {
           }
 
           // JumpServer 状态机
-
-          // 阶段1: 等待 Opt> 提示符
           if (stage === 'init' && buffer.includes('Opt>')) {
             stage = 'opt';
-            console.error('[SSH] 输入目标服务器 IP');
             stream.write(K8S_SERVER.host + '\r');
           }
-          // 阶段2: 等待 [Host]> 提示符
           else if (stage === 'opt' && buffer.includes('[Host]>')) {
             stage = 'host';
-            console.error('[SSH] 选择服务器 ID: ' + K8S_SERVER.selectOption);
             stream.write(K8S_SERVER.selectOption + '\r');
           }
-          // 阶段3: 等待进入服务器 shell
           else if (stage === 'host' && (buffer.includes('~]$') || buffer.includes('~]#'))) {
             stage = 'server';
-            console.error('[SSH] 已进入服务器，执行 kubectl 命令');
-            console.error(`[SSH] 命令: ${kubectlCommand.substring(0, 100)}...`);
-
-            // 重置 buffer，开始收集 kubectl 输出
             kubectlOutput = '';
             collectingOutput = true;
-
             stream.write(kubectlCommand + '\r');
             stage = 'kubectl';
           }
-          // 阶段4: kubectl 执行完成
           else if (stage === 'kubectl' && collectingOutput && kubectlOutput.length > 50) {
-            // 检测命令执行完成（返回到 shell 提示符）
             if (kubectlOutput.includes('~]$') || kubectlOutput.includes('~]#')) {
               stage = 'done';
               collectingOutput = false;
-              console.error('[SSH] 命令执行完成，退出');
-
-              // 立即退出
               stream.write('exit\r');
               stream.write('exit\r');
-              setTimeout(() => stream.end(), 500);
+              setTimeout(() => { try { stream.end(); } catch {} }, 300);
             }
           }
         });
 
-        stream.stderr.on('data', (data) => {
-          console.error('[SSH stderr]', data.toString());
-        });
+        stream.stderr.on('data', () => {});
       });
     });
 
     conn.on('error', (err) => {
       clearTimeout(timeoutId);
-      reject(new Error(`SSH 连接错误: ${err.message}`));
+      if (!settled) { settled = true; reject(new Error(`SSH 连接错误: ${err.message}`)); }
     });
 
-    // 连接堡垒机
     conn.connect({
       host: JUMP_HOST.host,
       port: JUMP_HOST.port,
@@ -323,4 +406,7 @@ export async function executeKubectl(kubectlCommand, options = {}) {
       readyTimeout: DEFAULTS.connectTimeout
     });
   });
+  } finally {
+    sshRelease();
+  }
 }

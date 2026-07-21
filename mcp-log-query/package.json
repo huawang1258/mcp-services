@@ -1,16 +1,19 @@
 {
   "name": "mcp-log-query-server",
-  "version": "1.0.0",
-  "description": "MCP Server for querying server logs via SSH jump host",
+  "version": "3.9.0",
+  "description": "MCP Server for querying server logs via SSH jump host and Grafana Loki API",
   "main": "index.js",
   "type": "module",
   "bin": {
-    "mcp-log-query": "./index.js"
+    "mcp-log-query": "index.js"
   },
   "files": [
     "index.js",
     "config.js",
     "ssh-client.js",
+    "loki-client.js",
+    "service-discovery.js",
+    "logger.js",
     "server-sse.js",
     "README.md"
   ],
@@ -35,8 +38,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/huawang1258/mcp-services.git"
+    "url": "git+https://github.com/huawang1258/mcp-services.git"
   },
   "homepage": "https://github.com/huawang1258/mcp-services#readme"
 }
-

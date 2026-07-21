@@ -4,16 +4,18 @@
  * Log Query MCP Server
  *
  * 提供以下工具：
- * - query_log: 查询服务日志
- * - search_log: 搜索日志关键词
+ * - query_log: 查询服务日志（支持测试环境 SSH + 生产环境 Loki）
+ * - search_log: 搜索日志关键词（生产环境自动提取 traceId）
  * - list_services: 列出可用服务
  * - test_connection: 测试 SSH 连接
  * - list_pods: 列出 pods 及状态
  * - describe_pod: 获取 pod 详情
  * - get_pod_logs: 获取 pod 日志
  * - get_events: 获取 namespace 事件
- * - trace_log: 根据 traceId 跨服务查询日志
+ * - trace_log: 根据 traceId 跨服务查询日志（生产环境一次查询所有服务）
  * - detect_context: 根据工作目录自动检测 namespace 和服务
+ * - list_loki_environments: 列出可用的 Loki 生产环境
+ * - list_loki_services: 列出 Loki 环境下的服务
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -24,13 +26,66 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { queryLog, testConnection, executeKubectl } from './ssh-client.js';
-import { findService, getAllServices, DEFAULTS, DEFAULT_NAMESPACE, SERVICES, NAMESPACES, detectContextFromPath } from './config.js';
+import { findService, getAllServices, DEFAULTS, DEFAULT_NAMESPACE, SERVICES, NAMESPACES, detectContextFromPath, isLokiEnv, resolveLokiEnvName, LOKI_ENVIRONMENTS } from './config.js';
+import { log, getLogFilePath } from './logger.js';
+import {
+  queryLoki, queryLokiAutoRange, parseTimeStr,
+  extractTraceIds, parseServiceFromFilename, groupLogsByService,
+  buildServiceLogQL, buildProjectLogQL, getLokiServiceDirName, getLokiLogSubPath,
+  listLokiEnvironments as getLokiEnvList, listLokiServices as getLokiSvcList
+} from './loki-client.js';
+import { resolveLokiTarget, resolveK8sService, getAllServiceNames } from './service-discovery.js';
+
+// 超时配置
+const REQUEST_TIMEOUT = 60000;             // MCP 请求兑底超时 60s（withTimeout 强制终止）
+const WATCHDOG_WARN_TIMEOUT = 120000;      // 看门狗 120s，仅记录告警（不再 process.exit）
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} 超时(${ms}ms)`)), ms)
+    ),
+  ]);
+}
+
+// 安全序列化工具参数（截断超长值，容错循环引用）
+function safeStringify(obj, maxLen = 200) {
+  try {
+    const s = JSON.stringify(obj);
+    return s.length > maxLen ? s.slice(0, maxLen) + '...' : s;
+  } catch {
+    return '<unserializable>';
+  }
+}
+
+// 合并多个 AbortSignal：任何一个 abort 则聚合 signal abort
+// Node 20+ 原生支持 AbortSignal.any；低版本回退到手工监听
+function anySignal(signals) {
+  const valid = signals.filter(Boolean);
+  if (valid.length === 0) return undefined;
+  if (valid.length === 1) return valid[0];
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any(valid);
+  // 回退方案
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  for (const s of valid) {
+    if (s.aborted) { ctrl.abort(); break; }
+    s.addEventListener('abort', onAbort, { once: true });
+  }
+  return ctrl.signal;
+}
+
+// 进程级安全网：只记录日志，不退出进程
+// 退出会导致 stdio 断开，整个 MCP 不可用直到 IDE 重启；单次请求错误不应拖死服务
+process.on('unhandledRejection', (err) => log(`[unhandledRejection] ${err && err.stack || err}`));
+process.on('uncaughtException', (err) => log(`[uncaughtException] ${err && err.stack || err}`));
 
 // 创建 MCP Server
 const server = new Server(
   {
     name: 'mcp-log-query',
-    version: '2.0.0',
+    version: '3.8.2',
   },
   {
     capabilities: {
@@ -45,7 +100,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: 'query_log',
-        description: '查询服务容器的日志文件。返回最近的日志内容。',
+        description: '查询服务容器的日志文件。返回最近的日志内容。支持通过 env 参数查询生产环境日志（Loki）。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -61,14 +116,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: '返回的日志行数，默认 100',
               default: 100
+            },
+            env: {
+              type: 'string',
+              description: '环境标识。默认 saas-itest（测试环境，走 SSH）。可选值：saas-itest（测试环境）、cms/prod/生产（CMS生产环境）、pre/预发/预发布（预发布环境，与 CMS 共用 Grafana）、城阳/cy/chengyang、临颖/ly/linying、漯河/lh/luohe、德阳/dy/deyang、旌阳/jy/jingyang（私有化环境）',
+              default: 'saas-itest'
+            },
+            from: {
+              type: 'string',
+              description: '(Loki) 查询起始时间，如 "2026-02-05 10:00:00"。指定后禁用自动递进'
+            },
+            to: {
+              type: 'string',
+              description: '(Loki) 查询结束时间，如 "2026-02-06 12:00:00"。不指定则为当前时间'
             }
           },
-          required: ['service']
+          required: ['service', 'env']
         }
       },
       {
         name: 'search_log',
-        description: '在服务日志中搜索关键词。支持正则表达式。',
+        description: '在服务日志中搜索关键词。支持正则表达式。生产环境会自动提取 traceId 列表。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -93,17 +161,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'boolean',
               description: '是否区分大小写，默认 false',
               default: false
+            },
+            env: {
+              type: 'string',
+              description: '环境标识。默认 saas-itest（测试环境，走 SSH）。可选值：saas-itest（测试环境）、cms/prod/生产（CMS生产环境）、pre/预发/预发布（预发布环境，与 CMS 共用 Grafana）、城阳/cy/chengyang、临颖/ly/linying、漯河/lh/luohe、德阳/dy/deyang、旌阳/jy/jingyang（私有化环境）',
+              default: 'saas-itest'
+            },
+            from: {
+              type: 'string',
+              description: '(Loki) 查询起始时间，如 "2026-02-05 10:00:00"。指定后禁用自动递进'
+            },
+            to: {
+              type: 'string',
+              description: '(Loki) 查询结束时间，如 "2026-02-06 12:00:00"。不指定则为当前时间'
             }
           },
-          required: ['service', 'keyword']
+          required: ['service', 'keyword', 'env']
         }
       },
       {
         name: 'list_services',
-        description: '列出所有可查询日志的服务',
+        description: '列出所有可查询日志的服务。新部署的服务无需注册即可直接查询（自动发现）；传 discover=true 可额外列出 K8s 中已部署但未静态注册的服务',
         inputSchema: {
           type: 'object',
-          properties: {}
+          properties: {
+            discover: {
+              type: 'boolean',
+              description: '是否通过 kubectl 动态发现未注册的新服务，默认 false',
+              default: false
+            },
+            namespace: {
+              type: 'string',
+              description: '动态发现使用的 K8s namespace，默认 saas-itest'
+            }
+          }
         }
       },
       {
@@ -201,7 +292,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'trace_log',
-        description: '根据 traceId 跨服务查询日志，用于追踪完整调用链',
+        description: '根据 traceId 跨服务查询日志，用于追踪完整调用链。生产环境使用 Loki API 一次查询所有服务。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -222,9 +313,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: '显示匹配行前后的上下文行数，默认 3',
               default: 3
+            },
+            env: {
+              type: 'string',
+              description: '环境标识。默认 saas-itest（测试环境，走 SSH）。可选值：saas-itest（测试环境）、cms/prod/生产（CMS生产环境）、pre/预发/预发布（预发布环境，与 CMS 共用 Grafana）、城阳/cy/chengyang、临颖/ly/linying、漯河/lh/luohe、德阳/dy/deyang、旌阳/jy/jingyang（私有化环境）',
+              default: 'saas-itest'
+            },
+            from: {
+              type: 'string',
+              description: '(Loki) 查询起始时间，如 "2026-02-05 10:00:00"。指定后禁用自动递进'
+            },
+            to: {
+              type: 'string',
+              description: '(Loki) 查询结束时间，如 "2026-02-06 12:00:00"。不指定则为当前时间'
             }
           },
-          required: ['traceId']
+          required: ['traceId', 'env']
         }
       },
       // ========== 上下文检测工具 ==========
@@ -241,33 +345,170 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ['workspace_path']
         }
+      },
+      // ========== 自定义命令工具 ==========
+      {
+        name: 'exec_in_pod',
+        description: '在指定 pod 内执行自定义命令。适用于日志文件路径不在默认配置中、需要 ls/cat/wc 等探索性操作、或需要自定义 grep/tail 参数的场景。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            pod: {
+              type: 'string',
+              description: 'Pod 名称或名称模式（支持部分匹配）'
+            },
+            command: {
+              type: 'string',
+              description: '要在 pod 内执行的命令，如 grep -C 5 "keyword" /www/logs/app/application.out'
+            },
+            namespace: {
+              type: 'string',
+              description: 'K8s namespace，默认 saas-itest',
+              default: 'saas-itest'
+            }
+          },
+          required: ['pod', 'command']
+        }
+      },
+      // ========== Loki 生产环境工具 ==========
+      {
+        name: 'list_loki_environments',
+        description: '列出所有可用的 Loki 生产环境',
+        inputSchema: {
+          type: 'object',
+          properties: {}
+        }
+      },
+      {
+        name: 'list_loki_services',
+        description: '列出指定 Loki 环境下的所有可用服务',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            env: {
+              type: 'string',
+              description: '环境标识。可选值：cms/prod/生产（CMS生产环境）、pre/预发/预发布（预发布环境，与 CMS 共用 Grafana）、城阳/cy/chengyang、临颖/ly/linying、漯河/lh/luohe、德阳/dy/deyang、旌阳/jy/jingyang（私有化环境）',
+              default: 'cms'
+            },
+            project: {
+              type: 'string',
+              description: '项目名，默认 senior',
+              default: 'senior'
+            }
+          }
+        }
       }
     ]
   };
 });
 // 处理工具调用
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
+  const startTime = Date.now();
+  // SDK 传入的 signal：Cascade 发 notifications/cancelled 时 signal.aborted=true
+  const signal = extra && extra.signal;
+  log(`[Tool] → ${name} start args=${safeStringify(args)}`);
 
+  // 提前 cancel：立即抛错，让 SDK 检测到 signal.aborted 不发 response
+  if (signal && signal.aborted) {
+    log(`[Tool] ⊗ ${name} 收到请求时已 aborted，立即返回`);
+    throw new Error('Request cancelled before handler');
+  }
+
+  // 看门狗：仅记录长时间未完成的请求，不再退出进程
+  const watchdog = setTimeout(() => {
+    log(`[Watchdog] ${name} 仍在运行超过 ${WATCHDOG_WARN_TIMEOUT}ms（仅记录，不退出进程）`);
+  }, WATCHDOG_WARN_TIMEOUT);
+  watchdog.unref();
+
+  // cancel race：signal abort 时立即 reject，handler 不再等下游
+  const cancelPromise = new Promise((_, reject) => {
+    if (!signal) return;
+    const onAbort = () => {
+      log(`[Tool] ⊗ ${name} 收到 cancel signal (${Date.now() - startTime}ms)`);
+      reject(new Error('CANCELLED'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+  try {
+    const result = await Promise.race([
+      withTimeout(handleToolCall(name, args, signal), REQUEST_TIMEOUT, name),
+      cancelPromise,
+    ]);
+    clearTimeout(watchdog);
+    log(`[Tool] ✓ ${name} done ${Date.now() - startTime}ms`);
+    return result;
+  } catch (error) {
+    clearTimeout(watchdog);
+    // 取消场景：抛错让 SDK 知道（SDK 检测 signal.aborted 不发 response）
+    if (signal && signal.aborted) {
+      log(`[Tool] ⊗ ${name} CANCELLED ${Date.now() - startTime}ms`);
+      throw error;
+    }
+    log(`[Tool] ✗ ${name} FAIL ${Date.now() - startTime}ms: ${error.message}`);
+    return {
+      content: [{ type: 'text', text: `## 执行错误\n\n❌ ${error.message}` }],
+      isError: true
+    };
+  }
+});
+
+/**
+ * 实际的工具调用处理逻辑
+ * @param {string} name - 工具名
+ * @param {object} args - 工具参数
+ * @param {AbortSignal} [signal] - Cascade 传入的取消信号；层层传给 Loki/SSH/kubectl
+ */
+async function handleToolCall(name, args, signal) {
   try {
     switch (name) {
       case 'query_log': {
-        // 支持传入 namespace 参数覆盖默认值
-        const service = findService(args.service, args.namespace);
+        // 判断是否走 Loki（生产环境）
+        if (isLokiEnv(args.env)) {
+          const envKey = resolveLokiEnvName(args.env);
+          const envConfig = LOKI_ENVIRONMENTS[envKey];
+          const project = envConfig.defaultProject || 'senior';
+          const target = await resolveLokiTarget(envKey, envConfig, args.service);
+          const maxLines = args.lines || DEFAULTS.lines;
+
+          const expr = buildServiceLogQL(project, target.dirName, '', envKey, target.logSubPath);
+          log(`[MCP] Loki 查询日志: env=${envKey}, service=${args.service} (${target.source}: ${target.dirName}), expr=${expr}`);
+
+          // 构建时间范围选项
+          const timeOpts = { maxLines };
+          if (args.from) timeOpts.from = parseTimeStr(args.from);
+          if (args.to) timeOpts.to = parseTimeStr(args.to);
+          timeOpts.signal = signal;
+
+          const lokiResult = await queryLokiAutoRange(envKey, expr, timeOpts);
+
+          if (lokiResult.logs.length === 0) {
+            const errorHint = lokiResult.error ? `\n\n⚠️ **${lokiResult.error}**` : '';
+            return { content: [{ type: 'text', text: `## ${args.service} 日志 (${envKey} 生产环境)\n\n⚠️ 已自动搜索 5分钟 → 30分钟 → 1小时 → 3小时 → 24小时 范围，均未找到日志。${errorHint}\n\n请确认：\n1. 服务名是否正确\n2. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
+          }
+
+          let text = `## ${args.service} 日志 (${envKey} 生产环境, ${lokiResult.timeRange.label}内, ${lokiResult.logs.length} 行)\n\n`;
+          text += `\`\`\`\n${lokiResult.logs.join('\n')}\n\`\`\``;
+          if (lokiResult.traceIds.length > 0) {
+            text += `\n\n🔑 **提取到的 traceId** (${lokiResult.traceIds.length} 个):\n`;
+            lokiResult.traceIds.slice(0, 20).forEach((id, i) => { text += `  ${i + 1}. \`${id}\`\n`; });
+            if (lokiResult.traceIds.length > 20) text += `  ... 还有 ${lokiResult.traceIds.length - 20} 个\n`;
+          }
+          return { content: [{ type: 'text', text }] };
+        }
+
+        // 测试环境：走 SSH（静态配置未命中时自动发现）
+        const service = await resolveK8sService(args.service, args.namespace, signal);
         if (!service) {
-          return {
-            content: [{
-              type: 'text',
-              text: `错误: 未找到服务 "${args.service}"。使用 list_services 查看可用服务。`
-            }]
-          };
+          return { content: [{ type: 'text', text: `错误: 未找到服务 "${args.service}"（静态配置和 K8s deployment 均未匹配）。使用 list_services 查看可用服务，或用 list_pods 确认服务是否已部署。` }] };
         }
 
         const lines = args.lines || DEFAULTS.lines;
         const command = `tail -${lines}`;
 
-        console.error(`[MCP] 查询日志: ${service.name} (namespace: ${service.namespace}), 命令: ${command}`);
-        const result = await queryLog(service, command);
+        log(`[MCP] 查询日志: ${service.name} (namespace: ${service.namespace}), 命令: ${command}`);
+        const result = await queryLog(service, command, { signal });
 
         return {
           content: [{
@@ -278,15 +519,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'search_log': {
-        // 支持传入 namespace 参数覆盖默认值
-        const service = findService(args.service, args.namespace);
+        // 判断是否走 Loki（生产环境）
+        if (isLokiEnv(args.env)) {
+          const envKey = resolveLokiEnvName(args.env);
+          const envConfig = LOKI_ENVIRONMENTS[envKey];
+          const project = envConfig.defaultProject || 'senior';
+          const target = await resolveLokiTarget(envKey, envConfig, args.service);
+          const keyword = args.keyword;
+
+          const expr = buildServiceLogQL(project, target.dirName, keyword, envKey, target.logSubPath);
+          log(`[MCP] Loki 搜索日志: env=${envKey}, service=${args.service} (${target.source}: ${target.dirName}), keyword=${keyword}`);
+
+          // 构建时间范围选项
+          const timeOpts = { maxLines: 200 };
+          if (args.from) timeOpts.from = parseTimeStr(args.from);
+          if (args.to) timeOpts.to = parseTimeStr(args.to);
+          timeOpts.signal = signal;
+
+          const lokiResult = await queryLokiAutoRange(envKey, expr, timeOpts);
+
+          if (lokiResult.logs.length === 0) {
+            const errorHint = lokiResult.error ? `\n\n⚠️ **${lokiResult.error}**` : '';
+            return { content: [{ type: 'text', text: `## ${args.service} 日志搜索结果 (${envKey} 生产环境)\n\n**关键词**: ${keyword}\n\n⚠️ 已自动搜索 5分钟 → 30分钟 → 1小时 → 3小时 → 24小时 范围，均未找到匹配内容。${errorHint}\n\n请确认：\n1. 关键词是否正确\n2. 服务名是否正确\n3. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
+          }
+
+          let text = `## ${args.service} 日志搜索结果 (${envKey} 生产环境, ${lokiResult.timeRange.label}内)\n\n`;
+          text += `**关键词**: ${keyword}\n**匹配行数**: ${lokiResult.logs.length}\n**时间范围**: ${lokiResult.timeRange.label}\n\n`;
+          text += `\`\`\`\n${lokiResult.logs.join('\n')}\n\`\`\``;
+
+          // 自动提取 traceId（核心功能：帮助用户获取 traceId 进行链路追踪）
+          if (lokiResult.traceIds.length > 0) {
+            text += `\n\n🔑 **提取到的 traceId** (${lokiResult.traceIds.length} 个):\n`;
+            lokiResult.traceIds.slice(0, 20).forEach((id, i) => { text += `  ${i + 1}. \`${id}\`\n`; });
+            if (lokiResult.traceIds.length > 20) text += `  ... 还有 ${lokiResult.traceIds.length - 20} 个\n`;
+            text += `\n💡 **提示**: 可以使用 \`trace_log(traceId: "xxx", env: "${args.env}")\` 查看完整调用链`;
+          }
+          return { content: [{ type: 'text', text }] };
+        }
+
+        // 测试环境：走 SSH（静态配置未命中时自动发现）
+        const service = await resolveK8sService(args.service, args.namespace, signal);
         if (!service) {
-          return {
-            content: [{
-              type: 'text',
-              text: `错误: 未找到服务 "${args.service}"。使用 list_services 查看可用服务。`
-            }]
-          };
+          return { content: [{ type: 'text', text: `错误: 未找到服务 "${args.service}"（静态配置和 K8s deployment 均未匹配）。使用 list_services 查看可用服务，或用 list_pods 确认服务是否已部署。` }] };
         }
 
         const keyword = args.keyword;
@@ -296,8 +570,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const grepFlags = caseSensitive ? '' : '-i';
         const command = `grep ${grepFlags} -C ${contextLines} "${keyword}"`;
 
-        console.error(`[MCP] 搜索日志: ${service.name} (namespace: ${service.namespace}), 关键词: ${keyword}`);
-        const result = await queryLog(service, command);
+        log(`[MCP] 搜索日志: ${service.name} (namespace: ${service.namespace}), 关键词: ${keyword}`);
+        const result = await queryLog(service, command, { signal });
 
         return {
           content: [{
@@ -313,16 +587,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `- **${s.name}**: ${s.description}\n  别名: ${s.aliases.join(', ')}`
         ).join('\n');
 
+        let text = `## 可用服务列表（静态注册）\n\n${list}`;
+
+        // 可选：动态发现未注册服务
+        if (args.discover) {
+          try {
+            const namespace = args.namespace || DEFAULT_NAMESPACE;
+            const allNames = await getAllServiceNames(namespace, signal);
+            const staticNames = new Set(services.map(s => s.name));
+            const extra = allNames.filter(n => !staticNames.has(n));
+            if (extra.length > 0) {
+              text += `\n\n## 动态发现的未注册服务 (namespace: ${namespace})\n\n${extra.map(n => `- ${n}`).join('\n')}\n\n💡 这些服务可直接用于 query_log / search_log，无需手动注册`;
+            } else {
+              text += `\n\n✅ 未发现静态表之外的新服务`;
+            }
+          } catch (e) {
+            text += `\n\n⚠️ 动态发现失败: ${e.message.substring(0, 120)}`;
+          }
+        } else {
+          text += `\n\n💡 新部署的服务无需注册：query_log / search_log 会自动从 K8s deployment（测试环境）或 Loki filename（生产环境）发现。传 discover: true 可列出未注册服务。`;
+        }
+
         return {
           content: [{
             type: 'text',
-            text: `## 可用服务列表\n\n${list}`
+            text
           }]
         };
       }
 
       case 'test_connection': {
-        console.error('[MCP] 测试 SSH 连接');
+        log('[MCP] 测试 SSH 连接');
         const result = await testConnection();
 
         return {
@@ -341,8 +636,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           cmd += ` -l ${args.label}`;
         }
 
-        console.error(`[MCP] 列出 pods: namespace=${namespace}`);
-        const result = await executeKubectl(cmd);
+        log(`[MCP] 列出 pods: namespace=${namespace}`);
+        const result = await executeKubectl(cmd, { signal });
 
         return {
           content: [{
@@ -358,10 +653,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // 先查找匹配的 pod
         const findCmd = `kubectl get pod -n ${namespace} -o name | grep ${podPattern} | head -1`;
-        console.error(`[MCP] 查找 pod: ${podPattern}`);
+        log(`[MCP] 查找 pod: ${podPattern}`);
         
         const describeCmd = `kubectl describe $(kubectl get pod -n ${namespace} -o name | grep ${podPattern} | head -1) -n ${namespace}`;
-        const result = await executeKubectl(describeCmd);
+        const result = await executeKubectl(describeCmd, { signal });
 
         return {
           content: [{
@@ -382,8 +677,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           cmd += ' --previous';
         }
 
-        console.error(`[MCP] 获取 pod 日志: ${podPattern}, previous=${previous}`);
-        const result = await executeKubectl(cmd);
+        log(`[MCP] 获取 pod 日志: ${podPattern}, previous=${previous}`);
+        const result = await executeKubectl(cmd, { signal });
 
         const logType = previous ? '崩溃前日志' : '当前日志';
         return {
@@ -402,8 +697,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           cmd = `kubectl get events -n ${namespace} --field-selector involvedObject.name=${args.pod} --sort-by='.lastTimestamp'`;
         }
 
-        console.error(`[MCP] 获取事件: namespace=${namespace}`);
-        const result = await executeKubectl(cmd);
+        log(`[MCP] 获取事件: namespace=${namespace}`);
+        const result = await executeKubectl(cmd, { signal });
 
         return {
           content: [{
@@ -416,62 +711,126 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'trace_log': {
         const traceId = args.traceId;
         const contextLines = args.context_lines || 3;
-        const targetNamespace = args.namespace || null;  // 支持指定 namespace
+
+        // 判断是否走 Loki（生产环境）- 一次 API 调用搜索所有服务
+        if (isLokiEnv(args.env)) {
+          const envKey = resolveLokiEnvName(args.env);
+          const envConfig = LOKI_ENVIRONMENTS[envKey];
+          const project = envConfig.defaultProject || 'senior';
+
+          // 构建时间范围选项
+          const timeOpts = {};
+          if (args.from) timeOpts.from = parseTimeStr(args.from);
+          if (args.to) timeOpts.to = parseTimeStr(args.to);
+
+          // 如果指定了服务列表，按服务查询；否则按项目查询（一次搜索所有服务）
+          let lokiResult;
+          const targetServices = args.services || [];
+
+          if (targetServices.length > 0) {
+            // 指定服务：逐个查询
+            const allLogs = [];
+            const allLabels = [];
+            for (const svc of targetServices) {
+              const target = await resolveLokiTarget(envKey, envConfig, svc);
+              const expr = buildServiceLogQL(project, target.dirName, traceId, envKey, target.logSubPath);
+              log(`[MCP] Loki trace: env=${envKey}, service=${svc}, traceId=${traceId}`);
+              const r = await queryLokiAutoRange(envKey, expr, { ...timeOpts, maxLines: 500, signal });
+              allLogs.push(...r.logs);
+              allLabels.push(...r.labels);
+            }
+            lokiResult = { logs: allLogs, labels: allLabels, traceIds: extractTraceIds(allLogs), timeRange: { label: '自动递进' } };
+          } else {
+            // 未指定服务：按项目一次查询所有服务（高效！）
+            const expr = buildProjectLogQL(project, traceId, envKey);
+            log(`[MCP] Loki trace (全项目): env=${envKey}, project=${project}, traceId=${traceId}`);
+            lokiResult = await queryLokiAutoRange(envKey, expr, { ...timeOpts, maxLines: 1000, signal });
+          }
+
+          if (lokiResult.logs.length === 0) {
+            const errorHint = lokiResult.error ? `\n\n⚠️ **${lokiResult.error}**` : '';
+            return { content: [{ type: 'text', text: `## TraceId 追踪结果 (${envKey} 生产环境)\n\n**traceId**: \`${traceId}\`\n\n❌ 已自动搜索 5分钟 → 30分钟 → 1小时 → 3小时 → 24小时 范围，均未找到匹配日志。${errorHint}\n\n请确认：\n1. traceId 是否正确\n2. 如需查询更早的日志，请使用 \`from\`/\`to\` 参数指定具体时间范围` }] };
+          }
+
+          // 按服务分组展示
+          const groups = groupLogsByService(lokiResult);
+          const serviceNames = Object.keys(groups).sort();
+
+          let text = `## TraceId 追踪结果 (${envKey} 生产环境, ${lokiResult.timeRange.label}内)\n\n`;
+          text += `**traceId**: \`${traceId}\`\n`;
+          text += `**匹配服务数**: ${serviceNames.length}\n`;
+          text += `**总日志行数**: ${lokiResult.logs.length}\n\n`;
+
+          for (const svcName of serviceNames) {
+            const group = groups[svcName];
+            text += `### ${svcName}\n`;
+            text += `\`\`\`\n${group.logs.join('\n')}\n\`\`\`\n\n`;
+          }
+
+          return { content: [{ type: 'text', text }] };
+        }
+
+        // 测试环境：走 SSH（逐个服务搜索）
+        const targetNamespace = args.namespace || null;
         let servicesToSearch = args.services || [];
 
-        // 如果没有指定服务，搜索所有服务
         if (servicesToSearch.length === 0) {
-          servicesToSearch = Object.keys(SERVICES);
+          // 静态表 + K8s 动态发现合并（发现失败自动降级为静态表）
+          servicesToSearch = await getAllServiceNames(targetNamespace, signal);
         } else {
-          // 解析服务别名
           servicesToSearch = servicesToSearch.map(s => {
             const service = findService(s, targetNamespace);
             return service ? service.name : s;
           }).filter(Boolean);
         }
 
-        console.error(`[MCP] 追踪日志: traceId=${traceId}, namespace=${targetNamespace || 'default'}, 服务数=${servicesToSearch.length}`);
+        log(`[MCP] 追踪日志: traceId=${traceId}, namespace=${targetNamespace || 'default'}, 服务数=${servicesToSearch.length}`);
 
+        const TRACE_TOTAL_TIMEOUT = 50000;  // 总耗时上限 50s
+        const TRACE_PER_SERVICE = 10000;    // 单服务超时 10s
+        const traceStart = Date.now();
         const results = [];
+        let searched = 0;
+        let skipped = 0;
+
         for (const serviceName of servicesToSearch) {
-          // 使用 findService 获取服务配置，支持 namespace 覆盖
-          const service = findService(serviceName, targetNamespace);
-          if (!service) continue;
+          // 总耗时检查
+          if (Date.now() - traceStart > TRACE_TOTAL_TIMEOUT) {
+            skipped = servicesToSearch.length - searched;
+            log(`[MCP] trace_log 总耗时超过 ${TRACE_TOTAL_TIMEOUT}ms，跳过剩余 ${skipped} 个服务`);
+            break;
+          }
+
+          const service = await resolveK8sService(serviceName, targetNamespace, signal);
+          if (!service) { searched++; continue; }
 
           try {
             const command = `grep -i -C ${contextLines} "${traceId}"`;
-            const result = await queryLog(service, command);
+            const result = await queryLog(service, command, { timeout: TRACE_PER_SERVICE, signal });
 
             if (result && result.trim() && !result.includes('未找到')) {
-              results.push({
-                service: serviceName,
-                namespace: service.namespace,
-                logs: result
-              });
+              results.push({ service: serviceName, namespace: service.namespace, logs: result });
             }
           } catch (err) {
-            // 忽略单个服务的错误，继续搜索其他服务
-            console.error(`[MCP] 搜索 ${serviceName} 失败: ${err.message}`);
+            // 快速跳过失败/超时的服务
+            log(`[MCP] ${serviceName} 跳过: ${err.message.substring(0, 80)}`);
           }
+          searched++;
         }
+
+        const elapsed = Date.now() - traceStart;
+        const timeNote = skipped > 0 ? `\n**注意**: 已搜索 ${searched}/${servicesToSearch.length} 个服务（耗时 ${elapsed}ms，跳过 ${skipped} 个）` : '';
 
         if (results.length === 0) {
-          return {
-            content: [{
-              type: 'text',
-              text: `## TraceId 追踪结果\n\n**traceId**: ${traceId}\n**namespace**: ${targetNamespace || '默认'}\n\n❌ 未在任何服务中找到匹配的日志`
-            }]
-          };
+          return { content: [{ type: 'text', text: `## TraceId 追踪结果\n\n**traceId**: ${traceId}\n**namespace**: ${targetNamespace || '默认'}\n\n❌ 未在已搜索的 ${searched} 个服务中找到匹配的日志${timeNote}` }] };
         }
 
-        const output = results.map(r =>
-          `### ${r.service} (${r.namespace})\n\`\`\`\n${r.logs}\n\`\`\``
-        ).join('\n\n');
+        const output = results.map(r => `### ${r.service} (${r.namespace})\n\`\`\`\n${r.logs}\n\`\`\``).join('\n\n');
 
         return {
           content: [{
             type: 'text',
-            text: `## TraceId 追踪结果\n\n**traceId**: ${traceId}\n**namespace**: ${targetNamespace || '默认'}\n**匹配服务数**: ${results.length}\n\n${output}`
+            text: `## TraceId 追踪结果\n\n**traceId**: ${traceId}\n**namespace**: ${targetNamespace || '默认'}\n**匹配服务数**: ${results.length}${timeNote}\n\n${output}`
           }]
         };
       }
@@ -512,7 +871,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           responseText += `- **service**: \`${result.serviceName}\`\n`;
         }
 
-        console.error(`[MCP] 上下文检测: path=${workspacePath}, namespace=${result.namespace}, service=${result.serviceName}`);
+        log(`[MCP] 上下文检测: path=${workspacePath}, namespace=${result.namespace}, service=${result.serviceName}`);
 
         return {
           content: [{
@@ -520,6 +879,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: responseText
           }]
         };
+      }
+
+      // ========== 自定义命令工具处理 ==========
+      case 'exec_in_pod': {
+        const namespace = args.namespace || DEFAULT_NAMESPACE;
+        const podPattern = args.pod;
+        const command = args.command;
+
+        const cmd = `kubectl exec $(kubectl get pod -n ${namespace} -o name | grep ${podPattern} | head -1) -n ${namespace} -- ${command}`;
+        log(`[MCP] exec_in_pod: pod=${podPattern}, command=${command}`);
+        const result = await executeKubectl(cmd, { signal });
+
+        return {
+          content: [{
+            type: 'text',
+            text: `## Pod 命令执行结果\n\n**Pod**: ${podPattern}\n**Namespace**: ${namespace}\n**Command**: \`${command}\`\n\n\`\`\`\n${result}\n\`\`\``
+          }]
+        };
+      }
+
+      // ========== Loki 生产环境工具处理 ==========
+      case 'list_loki_environments': {
+        const envs = getLokiEnvList();
+        if (envs.length === 0) {
+          return { content: [{ type: 'text', text: '## Loki 环境列表\n\n⚠️ 未配置任何 Loki 环境' }] };
+        }
+
+        const list = envs.map(e =>
+          `- **${e.name}**: ${e.description}\n  Grafana: ${e.grafanaUrl}\n  默认项目: ${e.project}`
+        ).join('\n');
+
+        return { content: [{ type: 'text', text: `## Loki 生产环境列表\n\n${list}` }] };
+      }
+
+      case 'list_loki_services': {
+        const envKey = resolveLokiEnvName(args.env || 'cms');
+        const project = args.project || 'senior';
+
+        if (!envKey || !LOKI_ENVIRONMENTS[envKey]) {
+          return { content: [{ type: 'text', text: `错误: 未知环境 "${args.env}"。使用 list_loki_environments 查看可用环境。` }] };
+        }
+
+        log(`[MCP] 列出 Loki 服务: env=${envKey}, project=${project}`);
+        const services = await getLokiSvcList(envKey, project);
+
+        if (services.length === 0) {
+          return { content: [{ type: 'text', text: `## Loki 服务列表 (${envKey})\n\n⚠️ 未找到任何服务` }] };
+        }
+
+        const list = services.map((s, i) => `  ${i + 1}. ${s}`).join('\n');
+        return { content: [{ type: 'text', text: `## Loki 服务列表 (${envKey}, project=${project})\n\n共 ${services.length} 个服务:\n${list}` }] };
       }
 
       default:
@@ -531,7 +941,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
     }
   } catch (error) {
-    console.error(`[MCP] 错误: ${error.message}`);
+    log(`[MCP] 工具内部错误: ${error.message}`);
     return {
       content: [{
         type: 'text',
@@ -540,16 +950,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true
     };
   }
-});
+}
+
+// 优雅关闭（对齐 auggie MCP 启动代码）
+function gracefulShutdown() {
+  log('[MCP] 优雅关闭...');
+  server.close().catch(() => {});
+  // 给 close 一点时间完成，然后强制退出
+  setTimeout(() => process.exit(0), 500).unref();
+}
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
 
 // 启动服务器
 async function main() {
+  // 对齐 auggie: 监听 stdin end/close，宿主进程断开时优雅关闭
+  process.stdin.on('end', () => {
+    log('[MCP] stdin end, initiating graceful shutdown');
+    gracefulShutdown();
+  });
+  process.stdin.on('close', () => {
+    log('[MCP] stdin close, initiating graceful shutdown');
+    gracefulShutdown();
+  });
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('[MCP] Log Query Server v2.0 已启动');
+  const logPath = getLogFilePath();
+  log(`[MCP] Log Query Server v3.8.2 已启动 (仅文件日志，避免 stderr backpressure 阻塞 event loop)`);
+  if (logPath) log(`[MCP] 本地日志文件: ${logPath}`);
 }
 
 main().catch((error) => {
-  console.error('[MCP] 启动失败:', error);
+  log(`[MCP] 启动失败: ${error && error.stack || error}`);
   process.exit(1);
 });
