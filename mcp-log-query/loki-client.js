@@ -315,12 +315,13 @@ export function extractTraceIds(lines) {
  */
 export function parseServiceFromFilename(filename) {
   if (!filename) return null;
-  // 匹配 /{service-name}-app/ 或 /{service-name}-service/ 模式
-  const match = filename.match(/\/(clife-senior-[a-zA-Z0-9-]+?)(?:-app|-service)\//);
+  // 提取日志目录段: .../{dir}/normal_logs/normal.log 或 .../{dir}/application.out
+  // 再剥离部署后缀（-app/-service/-start），兼容无后缀目录（如 clife-senior-svc-fulfill）
+  const m = filename.match(/\/([^/]+)\/(?:normal_logs\/[^/]+|application\.out)$/);
+  if (m) return m[1].replace(/-(app|service|start)$/, '');
+  // 兜底：匹配 /{service-name}-app/ 或 /{service-name}-service/ 模式
+  const match = filename.match(/\/([a-zA-Z0-9-]+?)(?:-app|-service)\//);
   if (match) return match[1];
-  // 兜底：匹配非 clife-senior 前缀的服务（如 device-manage-service）
-  const match2 = filename.match(/\/([a-zA-Z0-9-]+?)(?:-app|-service)\//);
-  if (match2) return match2[1];
   return null;
 }
 
