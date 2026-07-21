@@ -8,6 +8,8 @@
  * - Grafana Loki 生产环境配置
  */
 
+import { decryptValue } from './crypto-util.js';
+
 // 堡垒机配置 - 从环境变量读取
 export const JUMP_HOST = {
   host: process.env.MCP_JUMP_HOST || '',
@@ -573,6 +575,15 @@ export const LOKI_DEFAULTS = {
 };
 
 /**
+ * Grafana Loki 认证密码（密文存储）
+ * 运行时用环境变量 MCP_CONFIG_KEY 解密（在 mcp_config.json 的 env 中配置）；
+ * 也可用 MCP_GRAFANA_PASSWORD 直接覆盖。
+ * 生成新密文: node crypto-util.js encrypt "密码" <key>
+ */
+const LOKI_PASSWORD = process.env.MCP_GRAFANA_PASSWORD
+  || decryptValue('ENC:v1:ATHQaJx4U3wngne5zXVGyPxxTwb7OW7ZN7opScWuhY7zPJIvdAtaIcClB04LQBIbgVJkx4af');
+
+/**
  * Loki 环境配置
  * 支持多个 Grafana/Loki 实例（CMS 生产、私有化部署等）
  *
@@ -594,7 +605,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: parseInt(process.env.MCP_GRAFANA_DATASOURCE_ID || '35'),
     orgId: parseInt(process.env.MCP_GRAFANA_ORG_ID || '1'),
     username: process.env.MCP_GRAFANA_USER || 'loki',
-    password: process.env.MCP_GRAFANA_PASSWORD || 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'senior',  // 用于 {project="senior"} label 过滤
     pathProject: 'senior',     // 用于 filename 路径中的 project 段
     hasProjectLabel: true   // CMS 有 project 标签，可用 {project="senior"} 查询
@@ -609,7 +620,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: parseInt(process.env.MCP_GRAFANA_DATASOURCE_ID || '35'),
     orgId: parseInt(process.env.MCP_GRAFANA_ORG_ID || '1'),
     username: process.env.MCP_GRAFANA_USER || 'loki',
-    password: process.env.MCP_GRAFANA_PASSWORD || 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'pre-senior',  // 用于 {project="pre-senior"} label 过滤
     pathProject: 'senior',         // filename 路径里仍是 senior（注意：与 label 不同）
     hasProjectLabel: true
@@ -625,7 +636,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: 1,
     orgId: 1,
     username: 'loki',
-    password: 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false  // 无 project 标签，用 filename 正则匹配
   },
@@ -638,7 +649,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: 1,
     orgId: 1,
     username: 'loki',
-    password: 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
   },
@@ -651,7 +662,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: 1,
     orgId: 1,
     username: 'loki',
-    password: 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
   },
@@ -664,7 +675,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: 2,
     orgId: 1,
     username: 'loki',
-    password: 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
   },
@@ -677,7 +688,7 @@ export const LOKI_ENVIRONMENTS = {
     datasourceId: 1,
     orgId: 1,
     username: 'loki',
-    password: 'nihao123!!',
+    password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
   }

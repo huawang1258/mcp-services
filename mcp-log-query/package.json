@@ -1,6 +1,6 @@
 {
   "name": "mcp-log-query-server",
-  "version": "3.9.0",
+  "version": "3.10.0",
   "description": "MCP Server for querying server logs via SSH jump host and Grafana Loki API",
   "main": "index.js",
   "type": "module",
@@ -13,6 +13,7 @@
     "ssh-client.js",
     "loki-client.js",
     "service-discovery.js",
+    "crypto-util.js",
     "logger.js",
     "server-sse.js",
     "README.md"
