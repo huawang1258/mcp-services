@@ -575,13 +575,21 @@ export const LOKI_DEFAULTS = {
 };
 
 /**
- * Grafana Loki 认证密码（密文存储）
+ * Grafana Loki 敏感配置（全部密文存储：密码/用户名/URL/数据源 UID）
  * 运行时用环境变量 MCP_CONFIG_KEY 解密（在 mcp_config.json 的 env 中配置）；
- * 也可用 MCP_GRAFANA_PASSWORD 直接覆盖。
- * 生成新密文: node crypto-util.js encrypt "密码" <key>
+ * MCP_GRAFANA_* 环境变量可直接覆盖对应项。
+ * 生成新密文: node crypto-util.js encrypt "明文" <key>
  */
+const dec = decryptValue;
 const LOKI_PASSWORD = process.env.MCP_GRAFANA_PASSWORD
-  || decryptValue('ENC:v1:ATHQaJx4U3wngne5zXVGyPxxTwb7OW7ZN7opScWuhY7zPJIvdAtaIcClB04LQBIbgVJkx4af');
+  || dec('ENC:v1:ATHQaJx4U3wngne5zXVGyPxxTwb7OW7ZN7opScWuhY7zPJIvdAtaIcClB04LQBIbgVJkx4af');
+const LOKI_USERNAME = process.env.MCP_GRAFANA_USER
+  || dec('ENC:v1:LRAtdJJhju/JYb8RVntQNzgJFr8R7VEu8kCKForuVQktRn7GFOSoU7rsDlJAp7Ts');
+// CMS / 预发共用的 Grafana 地址与数据源
+const CMS_GRAFANA_URL = process.env.MCP_GRAFANA_URL
+  || dec('ENC:v1:ZYnw5S6vsxTX80zl6cLs12nGfF5gN9QvhL7otko6e02cxmSceK035XOmP3/TIM5PZADUxa19VuSPblNJy3VM/j8=');
+const CMS_LOKI_UID = process.env.MCP_GRAFANA_LOKI_UID
+  || dec('ENC:v1:kEWkKdB/VWdbrwevSrT6yMDuJdghJfkLLJ4wtH6gKr6eX9IQK8FBa24OwtClYuOQL6AKnHNRJSrebxbp/Y0DqUXxMamDEpdfi8QnP1qoegA=');
 
 /**
  * Loki 环境配置
@@ -600,11 +608,11 @@ export const LOKI_ENVIRONMENTS = {
   // CMS 生产环境（华为云）— 有 project 标签
   'cms': {
     description: 'CMS 生产环境（华为云）',
-    grafanaUrl: process.env.MCP_GRAFANA_URL || 'http://10.6.14.2:3000',
-    datasourceUid: process.env.MCP_GRAFANA_LOKI_UID || 'af2718a2-9c32-4364-a495-3bb29035199c',
+    grafanaUrl: CMS_GRAFANA_URL,
+    datasourceUid: CMS_LOKI_UID,
     datasourceId: parseInt(process.env.MCP_GRAFANA_DATASOURCE_ID || '35'),
     orgId: parseInt(process.env.MCP_GRAFANA_ORG_ID || '1'),
-    username: process.env.MCP_GRAFANA_USER || 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'senior',  // 用于 {project="senior"} label 过滤
     pathProject: 'senior',     // 用于 filename 路径中的 project 段
@@ -615,11 +623,11 @@ export const LOKI_ENVIRONMENTS = {
   // 注意：filename 路径里的 project 段仍然是 'senior'（不是 'pre-senior'），所以 pathProject 单独配置
   'pre': {
     description: '预发布环境（华为云，与 CMS 共用 Grafana）',
-    grafanaUrl: process.env.MCP_GRAFANA_URL || 'http://10.6.14.2:3000',
-    datasourceUid: process.env.MCP_GRAFANA_LOKI_UID || 'af2718a2-9c32-4364-a495-3bb29035199c',
+    grafanaUrl: CMS_GRAFANA_URL,
+    datasourceUid: CMS_LOKI_UID,
     datasourceId: parseInt(process.env.MCP_GRAFANA_DATASOURCE_ID || '35'),
     orgId: parseInt(process.env.MCP_GRAFANA_ORG_ID || '1'),
-    username: process.env.MCP_GRAFANA_USER || 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'pre-senior',  // 用于 {project="pre-senior"} label 过滤
     pathProject: 'senior',         // filename 路径里仍是 senior（注意：与 label 不同）
@@ -631,11 +639,11 @@ export const LOKI_ENVIRONMENTS = {
   // 城阳私有化
   'chengyang': {
     description: '城阳私有化环境',
-    grafanaUrl: 'https://cyjy-iot.chengyang.gov.cn/journals-loki',
-    datasourceUid: 'f17c8456-9ef4-4f44-9292-366681ac4f0c',
+    grafanaUrl: dec('ENC:v1:1pyOcXLZJE+VSIZNJb9nkZxJ7a8v9cGWoWqCV9XyQz0Ei/T6X47f92+GMRW1M3nLJSWIK+imyoTg8d0F29NN6VqA0HtFhFbze6/3HsvObRau0+mYO2M7xAh8VA=='),
+    datasourceUid: dec('ENC:v1:vpOkZqM0g9wE1tdGugPuCxB85bWgO7Ee+ncaaOtkqZ/WorbF1CzE3UXmSzlIEGOizjBAV5sVkkn0A9hPq3h1r8+6OAYoSFi4o0IPGP/qvOg='),
     datasourceId: 1,
     orgId: 1,
-    username: 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false  // 无 project 标签，用 filename 正则匹配
@@ -644,11 +652,11 @@ export const LOKI_ENVIRONMENTS = {
   // 临颖私有化
   'linying': {
     description: '临颖私有化环境',
-    grafanaUrl: 'https://zhyl-linying.cn/journals-loki',
-    datasourceUid: 'ae7df92c-e2d8-4fca-ac47-80d9c97aec95',
+    grafanaUrl: dec('ENC:v1:XLZN8AcNSNv/ZAz/jrgSt0YgxCBBDwjrqhzNDUSpiWFmrnVPDQF5C8aveE2kLiIEnNCGRH2mnwKBAqdcjJNGnAcgnCGwelVfpSCCrtDuG5QH'),
+    datasourceUid: dec('ENC:v1:BHut+mY0vni9zVTRSAkso8e76xsqLH4Jaz/TGNk0KaThU/M/OdtE8Qjd5V/bulSu3UtAuJK/jsj32fgozVuDq+m+Zb9G7H3xh+y1LI/Bycs='),
     datasourceId: 1,
     orgId: 1,
-    username: 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
@@ -657,11 +665,11 @@ export const LOKI_ENVIRONMENTS = {
   // 漯河私有化
   'luohe': {
     description: '漯河私有化环境',
-    grafanaUrl: 'https://zhyl.mzj.luohe.gov.cn/journals-loki',
-    datasourceUid: 'e527a5a6-0cf7-43de-8476-d9a00e0aa075',
+    grafanaUrl: dec('ENC:v1:UF8m2PGwLBEUl3yCcdkKlLW5VuytxLWKRhpCuw9QxZ8JN0CcMfUbQGBbHtrCDOJvOoabvRXvP52F2tA2N8UynPUFQwkQmM4pAAZ5Qymdb3p2v59MzwCS'),
+    datasourceUid: dec('ENC:v1:h0En99X/dwQbuI0tpme9PfGw85fk8G1l1+970zhmHS7CBWej4jwrMtZgqEbBehZTZ7XsEcNk9ADp6iXCDA7HrI4O/piBZ2huuSd/7r8s2Qc='),
     datasourceId: 1,
     orgId: 1,
-    username: 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
@@ -670,11 +678,11 @@ export const LOKI_ENVIRONMENTS = {
   // 德阳私有化
   'deyang': {
     description: '德阳私有化环境',
-    grafanaUrl: 'https://www.deyangyinfa.com/journals-loki',
-    datasourceUid: 'c628c402-062f-4ed0-ad32-b3c8aa7cec90',
+    grafanaUrl: dec('ENC:v1:fN3xnOHTMPmH4yZcTFWWEc4+xPfA++VuDYGkqgA11nrsDTruNa7SG5TLnVtxmbyq6Km2mCGnagIyUBIS//iagnN0WZdZTH07YQnJB5kAqWc/bfYVOA=='),
+    datasourceUid: dec('ENC:v1:QTGPBqtapxn7cFKf6wWawPfsjUI2WOSOg/n6rKinhECyuj5e4Y85/eMWJgVENQtobJTzcIumAstkHNaPiGszAFIT0sHHGKhBDdFCxDwC2RQ='),
     datasourceId: 2,
     orgId: 1,
-    username: 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
@@ -683,11 +691,11 @@ export const LOKI_ENVIRONMENTS = {
   // 旌阳私有化
   'jingyang': {
     description: '旌阳私有化环境',
-    grafanaUrl: 'https://www.jymzzhyl.cn/journals-loki',
-    datasourceUid: 'fa2cf4f6-4ee9-424b-a7c4-fa8be330f0c2',
+    grafanaUrl: dec('ENC:v1:lpr9ww9t+uJLho51p86w582SRcU91UCTqcVujR6USrTWsXTyW40fhcHn246mPWqIUgTxEd0DAlTzR+xkHoKd5RogKOZsFo/CPQIU1AAM5h56'),
+    datasourceUid: dec('ENC:v1:M7yGJ+780Ds0edHqn96iIKQ/gTq4jkzSCAPMnfboQD96kEuAN8FMmLa8ovxrh1RvmrdPKOVVhGjIrqTb7sNkyK6AUcTXLdFMZs6wM+BQg9k='),
     datasourceId: 1,
     orgId: 1,
-    username: 'loki',
+    username: LOKI_USERNAME,
     password: LOKI_PASSWORD,
     defaultProject: 'senior',
     hasProjectLabel: false
